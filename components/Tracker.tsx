@@ -14,6 +14,7 @@ export type Stop = {
   lat: number;
   lng: number;
   createdAt: number;
+  description: string;
 };
 
 type FedExDetails = {
@@ -24,12 +25,101 @@ type FedExDetails = {
   references: string[];
 };
 
+type AddressSuggestion = {
+  id: string;
+  label: string;
+  prediction: any;
+};
+
 const MapView = dynamic(() => import("./MapView"), {
   ssr: false,
   loading: () => <div className="map-loading">Preparing your map…</div>,
 });
 
 const STORAGE_KEY = "routepin-stops-v1";
+
+declare global {
+  interface Window {
+    google?: any;
+    __routepinGooglePromise?: Promise<any>;
+  }
+}
+
+function loadGooglePlaces(): Promise<any> {
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("Google Places requires a browser."));
+  }
+
+  if (window.google?.maps?.importLibrary) {
+    return window.google.maps.importLibrary("places");
+  }
+
+  if (window.__routepinGooglePromise) {
+    return window.__routepinGooglePromise;
+  }
+
+  const key = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
+
+  if (!key) {
+    return Promise.reject(
+      new Error("Add NEXT_PUBLIC_GOOGLE_MAPS_API_KEY to your .env.local file."),
+    );
+  }
+
+  window.__routepinGooglePromise = new Promise((resolve, reject) => {
+    const existing = document.querySelector(
+      'script[data-routepin-google="true"]',
+    ) as HTMLScriptElement | null;
+
+    const finish = async () => {
+      try {
+        if (!window.google?.maps?.importLibrary) {
+          throw new Error("Google Maps JavaScript API did not initialize.");
+        }
+
+        resolve(await window.google.maps.importLibrary("places"));
+      } catch (error) {
+        window.__routepinGooglePromise = undefined;
+        reject(error);
+      }
+    };
+
+    if (existing) {
+      existing.addEventListener("load", finish, { once: true });
+      existing.addEventListener(
+        "error",
+        () => {
+          window.__routepinGooglePromise = undefined;
+          reject(new Error("Could not load Google Maps."));
+        },
+        { once: true },
+      );
+
+      if (window.google?.maps?.importLibrary) {
+        void finish();
+      }
+
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.dataset.routepinGoogle = "true";
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(
+      key,
+    )}&v=weekly&loading=async`;
+    script.async = true;
+    script.defer = true;
+    script.onload = () => void finish();
+    script.onerror = () => {
+      window.__routepinGooglePromise = undefined;
+      reject(new Error("Could not load Google Maps. Check your API key."));
+    };
+
+    document.head.appendChild(script);
+  });
+
+  return window.__routepinGooglePromise;
+}
 
 function parseFedExPayload(raw: string): FedExDetails | null {
   if (!raw.includes("[)>")) return null;
@@ -58,7 +148,6 @@ function parseFedExPayload(raw: string): FedExDetails | null {
 
   if (markerIndex >= 0) {
     const afterMarker = fields.slice(markerIndex + 1);
-
     const street = afterMarker[0] ?? "";
     const city = afterMarker[1] ?? "";
     const province = afterMarker[2] ?? "";
@@ -83,11 +172,19 @@ function parseFedExPayload(raw: string): FedExDetails | null {
     /^(?:10Z|12Z|18Z|31Z|32Z|34Z)/i.test(value),
   );
 
-  if (!address && !weight && references.length === 0) {
-    return null;
-  }
+  if (!address && !weight && references.length === 0) return null;
 
   return { address, name, postalCode, weight, references };
+}
+
+function normalizeStop(stop: any): Stop {
+  return {
+    ...stop,
+    description: typeof stop.description === "string" ? stop.description : "",
+    name: typeof stop.name === "string" ? stop.name : "",
+    address: typeof stop.address === "string" ? stop.address : "",
+    barcode: typeof stop.barcode === "string" ? stop.barcode : "",
+  };
 }
 
 export default function Tracker() {
@@ -96,10 +193,26 @@ export default function Tracker() {
   const [barcode, setBarcode] = useState("");
   const [address, setAddress] = useState("");
   const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [scannerOpen, setScannerOpen] = useState(false);
   const [showCompleted, setShowCompleted] = useState(false);
+
+  const [suggestions, setSuggestions] = useState<AddressSuggestion[]>([]);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [placesReady, setPlacesReady] = useState(false);
+  const [optimizing, setOptimizing] = useState(false);
+
+  const selectedPlaceRef = useRef<{
+    address: string;
+    lat: number;
+    lng: number;
+  } | null>(null);
+
+  const placesSessionRef = useRef<any>(null);
+  const suggestionRequestRef = useRef(0);
+  const addressInputRef = useRef<HTMLTextAreaElement>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
@@ -107,15 +220,23 @@ export default function Tracker() {
   const hasScannedRef = useRef(false);
   const scannerStartingRef = useRef(false);
 
-  // Restore saved stops after mounting.
+  // Restore old and new saved stops. Older stops get an empty description.
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
 
       if (saved) {
         const parsed = JSON.parse(saved);
-        setStops(Array.isArray(parsed.stops) ? parsed.stops : []);
-        setCompleted(Array.isArray(parsed.completed) ? parsed.completed : []);
+
+        setStops(
+          Array.isArray(parsed.stops) ? parsed.stops.map(normalizeStop) : [],
+        );
+
+        setCompleted(
+          Array.isArray(parsed.completed)
+            ? parsed.completed.map(normalizeStop)
+            : [],
+        );
       }
     } catch {
       // Ignore malformed local data.
@@ -130,6 +251,134 @@ export default function Tracker() {
       // Storage may be unavailable.
     }
   }, [stops, completed]);
+
+  // Load Google's Places library.
+  useEffect(() => {
+    let cancelled = false;
+
+    loadGooglePlaces()
+      .then(() => {
+        if (!cancelled) setPlacesReady(true);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setMessage(
+            error instanceof Error
+              ? error.message
+              : "Google address suggestions could not be loaded.",
+          );
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Request address suggestions after the user pauses typing.
+  useEffect(() => {
+    const query = address.trim();
+    const requestId = ++suggestionRequestRef.current;
+
+    if (
+      !placesReady ||
+      !suggestionsOpen ||
+      !query ||
+      query.length < 3 ||
+      selectedPlaceRef.current?.address === query
+    ) {
+      setSuggestions([]);
+      return;
+    }
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const places = await loadGooglePlaces();
+
+        if (requestId !== suggestionRequestRef.current) return;
+
+        if (!placesSessionRef.current) {
+          placesSessionRef.current =
+            new window.google.maps.places.AutocompleteSessionToken();
+        }
+
+        const { suggestions: results } =
+          await places.AutocompleteSuggestion.fetchAutocompleteSuggestions({
+            input: query,
+            includedRegionCodes: ["ca"],
+            sessionToken: placesSessionRef.current,
+          });
+
+        if (requestId !== suggestionRequestRef.current) return;
+
+        setSuggestions(
+          (results ?? [])
+            .filter((result: any) => result.placePrediction)
+            .slice(0, 5)
+            .map((result: any) => ({
+              id: [
+                result.placePrediction.placeId,
+                result.placePrediction.text?.toString(),
+              ].join("-"),
+              label: result.placePrediction.text?.toString() ?? "",
+              prediction: result.placePrediction,
+            })),
+        );
+      } catch {
+        if (requestId === suggestionRequestRef.current) {
+          setSuggestions([]);
+        }
+      }
+    }, 450);
+
+    return () => window.clearTimeout(timer);
+  }, [address, placesReady, suggestionsOpen]);
+
+  const selectSuggestion = async (suggestion: AddressSuggestion) => {
+    try {
+      setBusy(true);
+      setMessage("Loading selected address…");
+      setSuggestionsOpen(false);
+      setSuggestions([]);
+
+      const place = suggestion.prediction.toPlace();
+
+      await place.fetchFields({
+        fields: ["formattedAddress", "location"],
+      });
+
+      const location = place.location;
+      const formattedAddress = place.formattedAddress || suggestion.label;
+
+      if (
+        !location ||
+        typeof location.lat !== "function" ||
+        typeof location.lng !== "function"
+      ) {
+        throw new Error(
+          "Google did not return coordinates for that address. Try another result.",
+        );
+      }
+
+      selectedPlaceRef.current = {
+        address: formattedAddress,
+        lat: location.lat(),
+        lng: location.lng(),
+      };
+
+      setAddress(formattedAddress);
+      placesSessionRef.current = null;
+      setMessage("Address selected. Confirm the details and add the stop.");
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Could not load the selected address.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const stopScanner = useCallback(() => {
     hasScannedRef.current = true;
@@ -159,21 +408,16 @@ export default function Tracker() {
 
     try {
       const { BrowserMultiFormatReader } = await import("@zxing/browser");
-
-      // FedEx structured shipping labels commonly use PDF417.
-      // Limiting formats avoids checking unrelated barcode formats.
       const hints = new Map<DecodeHintType, unknown>();
 
       hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]);
 
-      // Retry frequently after unsuccessful decode attempts.
       const reader = new BrowserMultiFormatReader(hints, {
         delayBetweenScanAttempts: 100,
       });
 
       readerRef.current = reader;
 
-      // Wait for React to mount the video element.
       let video = videoRef.current;
 
       for (let attempt = 0; !video && attempt < 20; attempt++) {
@@ -198,7 +442,6 @@ export default function Tracker() {
       ) => {
         if (!result || hasScannedRef.current) return;
 
-        // Lock immediately so the same frame cannot be processed twice.
         hasScannedRef.current = true;
 
         const raw = result.getText();
@@ -208,7 +451,11 @@ export default function Tracker() {
         setBarcode(raw);
 
         if (parsed) {
-          if (parsed.address) setAddress(parsed.address);
+          if (parsed.address) {
+            setAddress(parsed.address);
+            selectedPlaceRef.current = null;
+          }
+
           if (parsed.name) setName(parsed.name);
 
           const extraDetails = [
@@ -229,7 +476,7 @@ export default function Tracker() {
           );
         } else {
           setMessage(
-            `${format} barcode decoded, but the FedEx address format was not recognized. The decoded data has been captured; enter the delivery address manually.`,
+            `${format} barcode decoded, but the FedEx address format was not recognized. Enter the delivery address manually.`,
           );
         }
 
@@ -240,7 +487,6 @@ export default function Tracker() {
       };
 
       try {
-        // Prefer the iPhone's rear-facing camera.
         controlsRef.current = await reader.decodeFromConstraints(
           {
             audio: false,
@@ -256,12 +502,9 @@ export default function Tracker() {
       } catch (primaryError) {
         if (hasScannedRef.current) return;
 
-        // Fallback for browsers that cannot satisfy the preferred constraints.
         const devices = await BrowserMultiFormatReader.listVideoInputDevices();
 
-        if (!devices.length) {
-          throw primaryError;
-        }
+        if (!devices.length) throw primaryError;
 
         const preferred = devices.find((device) =>
           /back|rear|environment/i.test(device.label),
@@ -304,13 +547,10 @@ export default function Tracker() {
     const normalizedBarcode = barcode.trim();
 
     if (!destination) {
-      setMessage(
-        "No delivery address was detected. Enter the complete address manually.",
-      );
+      setMessage("Enter a delivery address before adding the stop.");
       return;
     }
 
-    // Check existing active stops before making a network request.
     if (
       normalizedBarcode &&
       stops.some((stop) => stop.barcode.trim() === normalizedBarcode)
@@ -323,42 +563,65 @@ export default function Tracker() {
     setMessage("Checking address…");
 
     try {
-      const response = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(destination)}`,
-        {
-          headers: { "Accept-Language": "en-CA,en" },
-        },
-      );
+      let lat: number;
+      let lng: number;
+      let displayAddress: string;
 
-      if (!response.ok) {
-        throw new Error("Address lookup failed. Please try again.");
-      }
+      // A selected Google suggestion already contains precise coordinates.
+      const selected = selectedPlaceRef.current;
 
-      const results = await response.json();
-
-      if (!results.length) {
-        throw new Error(
-          "Address not found. Check the street, city, province, and postal code.",
+      if (selected && selected.address === destination) {
+        lat = selected.lat;
+        lng = selected.lng;
+        displayAddress = selected.address;
+      } else {
+        // Keep manual address entry working as a fallback.
+        const response = await fetch(
+          `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(destination)}`,
+          { headers: { "Accept-Language": "en-CA,en" } },
         );
+
+        if (!response.ok) {
+          throw new Error("Address lookup failed. Please try again.");
+        }
+
+        const results = await response.json();
+
+        if (!results.length) {
+          throw new Error(
+            "Address not found. Select a suggestion or check the full address.",
+          );
+        }
+
+        lat = Number(results[0].lat);
+        lng = Number(results[0].lon);
+        displayAddress = results[0].display_name || destination;
       }
 
-      const hit = results[0];
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        throw new Error("The address did not return valid map coordinates.");
+      }
 
       const stop: Stop = {
         id: crypto.randomUUID(),
         name: name.trim() || parsed?.name || "",
-        address: hit.display_name || destination,
+        address: displayAddress,
         barcode: normalizedBarcode,
-        lat: Number(hit.lat),
-        lng: Number(hit.lon),
+        description: description.trim(),
+        lat,
+        lng,
         createdAt: Date.now(),
       };
+
+      // Prevent duplicates even if two add operations overlap.
+      let added = true;
 
       setStops((current) => {
         if (
           stop.barcode &&
           current.some((existing) => existing.barcode === stop.barcode)
         ) {
+          added = false;
           return current;
         }
 
@@ -368,7 +631,16 @@ export default function Tracker() {
       setAddress("");
       setBarcode("");
       setName("");
-      setMessage("Stop added to your map.");
+      setDescription("");
+      selectedPlaceRef.current = null;
+      placesSessionRef.current = null;
+      setSuggestions([]);
+      setSuggestionsOpen(false);
+      setMessage(
+        added
+          ? "Stop added to your map."
+          : "That barcode is already on your active stop list.",
+      );
     } catch (error) {
       setMessage(
         error instanceof Error ? error.message : "Could not add this stop.",
@@ -393,6 +665,120 @@ export default function Tracker() {
 
     setCompleted((current) => current.filter((s) => s.id !== id));
     setStops((current) => [stop, ...current]);
+    setMessage("Delivery moved back to active stops.");
+  };
+
+  const deleteStop = (id: string, isCompleted = false) => {
+    const stop = (isCompleted ? completed : stops).find((s) => s.id === id);
+    if (!stop) return;
+
+    if (!confirm(`Delete "${stop.name || stop.address}" from your tracker?`)) {
+      return;
+    }
+
+    if (isCompleted) {
+      setCompleted((current) => current.filter((s) => s.id !== id));
+    } else {
+      setStops((current) => current.filter((s) => s.id !== id));
+    }
+
+    setMessage("Stop deleted.");
+  };
+
+  const optimizeRoute = async () => {
+    if (!stops.length) {
+      setMessage("Add at least one stop before optimizing your route.");
+      return;
+    }
+
+    if (!navigator.geolocation) {
+      setMessage("Your browser does not support location services.");
+      return;
+    }
+
+    setOptimizing(true);
+    setMessage("Getting your current location…");
+
+    try {
+      const position = await new Promise<GeolocationPosition>(
+        (resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, {
+            enableHighAccuracy: true,
+            timeout: 15000,
+            maximumAge: 30000,
+          });
+        },
+      );
+
+      const origin = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+      };
+
+      if (!stops.length) return;
+
+      // OSRM's trip service optimizes the order of stops along the road
+      // network, starting at the current location.
+      const coordinates = [
+        `${origin.lng},${origin.lat}`,
+        ...stops.map((stop) => `${stop.lng},${stop.lat}`),
+      ].join(";");
+
+      setMessage("Optimizing stop order…");
+
+      const response = await fetch(
+        `https://router.project-osrm.org/trip/v1/driving/${coordinates}?source=first&roundtrip=false&overview=false`,
+      );
+
+      if (!response.ok) {
+        throw new Error("The route service is temporarily unavailable.");
+      }
+
+      const result = await response.json();
+
+      if (result.code !== "Ok" || !Array.isArray(result.waypoints)) {
+        throw new Error(
+          "Could not find a drivable route for these addresses. Check the map pins and try again.",
+        );
+      }
+
+      // OSRM waypoint_index is the position in the optimized trip.
+      // Input index 0 is our current location, not a delivery stop.
+      const optimized = stops
+        .map((stop, index) => ({
+          stop,
+          waypoint: result.waypoints[index + 1],
+        }))
+        .sort(
+          (a, b) =>
+            (a.waypoint?.waypoint_index ?? Number.MAX_SAFE_INTEGER) -
+            (b.waypoint?.waypoint_index ?? Number.MAX_SAFE_INTEGER),
+        )
+        .map((entry) => entry.stop);
+
+      if (optimized.some((stop) => !stop)) {
+        throw new Error("The route service returned an incomplete stop order.");
+      }
+
+      setStops(optimized);
+      setMessage(
+        "Route optimized from your current location. Follow the reordered stop list.",
+      );
+    } catch (error) {
+      let detail =
+        error instanceof Error ? error.message : "Could not optimize route.";
+
+      if (error instanceof GeolocationPositionError) {
+        detail =
+          error.code === error.PERMISSION_DENIED
+            ? "Location permission was denied. Allow location access and try again."
+            : "Could not get your location. Check GPS/location settings and try again.";
+      }
+
+      setMessage(detail);
+    } finally {
+      setOptimizing(false);
+    }
   };
 
   const clearDay = () => {
@@ -418,6 +804,12 @@ export default function Tracker() {
         : 0,
     [stops.length, completed.length],
   );
+
+  const updateAddress = (value: string) => {
+    setAddress(value);
+    selectedPlaceRef.current = null;
+    setSuggestionsOpen(true);
+  };
 
   return (
     <main className="app-shell">
@@ -518,7 +910,140 @@ export default function Tracker() {
           text-align: center;
         }
 
-        @media (max-width: 480px) {
+        .address-field {
+          position: relative;
+        }
+
+        .address-suggestions {
+          position: absolute;
+          z-index: 1000;
+          top: calc(100% - 2px);
+          right: 0;
+          left: 0;
+          overflow: hidden;
+          border: 1px solid #dce4eb;
+          border-radius: 0 0 12px 12px;
+          background: #fff;
+          box-shadow: 0 10px 25px rgba(16, 24, 40, 0.12);
+        }
+
+        .suggestion-button {
+          display: block;
+          width: 100%;
+          padding: 12px 14px;
+          border: 0;
+          border-bottom: 1px solid #edf0f3;
+          background: #fff;
+          color: #202c39;
+          font: inherit;
+          text-align: left;
+          cursor: pointer;
+        }
+
+        .suggestion-button:hover,
+        .suggestion-button:focus {
+          background: #f0f7ff;
+          outline: none;
+        }
+
+        .suggestion-button:last-child {
+          border-bottom: 0;
+        }
+
+        .suggestion-main {
+          display: block;
+          font-size: 13px;
+          font-weight: 600;
+          line-height: 1.45;
+        }
+
+        .suggestion-caption {
+          display: block;
+          margin-top: 6px;
+          padding: 7px 10px;
+          background: #f8fafc;
+          color: #64748b;
+          font-size: 10px;
+          text-align: right;
+        }
+
+        .optimize-button {
+          display: flex;
+          width: 100%;
+          align-items: center;
+          justify-content: center;
+          gap: 9px;
+          margin: 0 0 14px;
+          padding: 12px 14px;
+          border: 1px solid #b9d7fa;
+          border-radius: 12px;
+          background: #eff6ff;
+          color: #174b87;
+          font: inherit;
+          font-size: 13px;
+          font-weight: 700;
+          cursor: pointer;
+        }
+
+        .optimize-button:disabled {
+          opacity: 0.55;
+          cursor: wait;
+        }
+
+        .stop-description {
+          display: block;
+          margin-top: 7px;
+          color: #a65d00;
+          font-size: 13px;
+          font-weight: 700;
+          line-height: 1.45;
+          overflow-wrap: anywhere;
+        }
+
+        .stop-actions {
+          display: flex;
+          align-items: center;
+          gap: 7px;
+          flex-shrink: 0;
+        }
+
+        .delete-button {
+          display: inline-flex;
+          width: 34px;
+          height: 34px;
+          align-items: center;
+          justify-content: center;
+          border: 1px solid #f1c9c9;
+          border-radius: 9px;
+          background: #fff;
+          color: #b42318;
+          font-size: 18px;
+          cursor: pointer;
+        }
+
+        .delete-button:hover {
+          background: #fff1f0;
+        }
+
+        .completed-item .stop-actions {
+          margin-left: auto;
+        }
+
+        @media (max-width: 600px) {
+          .stop-item {
+            flex-wrap: wrap;
+          }
+
+          .stop-details {
+            min-width: 0;
+            flex: 1;
+          }
+
+          .stop-actions {
+            width: 100%;
+            justify-content: flex-end;
+          }
+
           .scan-frame {
             width: 92%;
             height: 40%;
@@ -705,7 +1230,11 @@ export default function Tracker() {
                   const parsed = parseFedExPayload(value);
 
                   if (parsed) {
-                    if (parsed.address) setAddress(parsed.address);
+                    if (parsed.address) {
+                      setAddress(parsed.address);
+                      selectedPlaceRef.current = null;
+                    }
+
                     if (parsed.name) setName(parsed.name);
 
                     setMessage(
@@ -729,20 +1258,56 @@ export default function Tracker() {
             </label>
 
             <label>
+              PACKAGE DESCRIPTION <span>OPTIONAL</span>
+              <input
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="e.g. Large box — behind passenger seat"
+              />
+            </label>
+
+            <label className="address-field">
               DELIVERY ADDRESS <b>*</b>
               <textarea
+                ref={addressInputRef}
                 required
                 value={address}
-                onChange={(e) => setAddress(e.target.value)}
-                placeholder="Street address, city, province, postal code"
+                onChange={(e) => updateAddress(e.target.value)}
+                onFocus={() => setSuggestionsOpen(true)}
+                onBlur={() => {
+                  // Allow a suggestion click to complete before closing.
+                  window.setTimeout(() => setSuggestionsOpen(false), 180);
+                }}
+                placeholder="Start typing a street address…"
                 rows={3}
+                autoComplete="off"
               />
+              {suggestionsOpen && suggestions.length > 0 && (
+                <div className="address-suggestions" role="listbox">
+                  {suggestions.map((suggestion) => (
+                    <button
+                      key={suggestion.id}
+                      type="button"
+                      className="suggestion-button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => void selectSuggestion(suggestion)}
+                    >
+                      <span className="suggestion-main">
+                        {suggestion.label}
+                      </span>
+                    </button>
+                  ))}
+                  <div className="suggestion-caption">
+                    Google Maps address suggestions
+                  </div>
+                </div>
+              )}
             </label>
 
             <button className="add-button" disabled={busy}>
               {busy ? (
                 <>
-                  <span className="spinner" /> Finding address…
+                  <span className="spinner" /> Working…
                 </>
               ) : (
                 <>
@@ -756,7 +1321,7 @@ export default function Tracker() {
           {message && (
             <div
               className={`message ${
-                /failed|could not|not found|already|no camera|camera error/i.test(
+                /failed|could not|not found|already|no camera|camera error|denied|error/i.test(
                   message,
                 )
                   ? "message-error"
@@ -771,8 +1336,8 @@ export default function Tracker() {
           <div className="privacy-note">
             <span>ⓘ</span>
             <p>
-              PDF417 barcodes are decoded in your browser. Always confirm the
-              delivery address before adding a stop.
+              PDF417 barcodes are decoded in your browser. Confirm the address
+              and package description before adding a stop.
             </p>
           </div>
         </aside>
@@ -798,6 +1363,18 @@ export default function Tracker() {
           </button>
         </div>
 
+        <button
+          type="button"
+          className="optimize-button"
+          disabled={optimizing || stops.length === 0}
+          onClick={() => void optimizeRoute()}
+        >
+          <span>{optimizing ? "◌" : "⌖"}</span>
+          {optimizing
+            ? "Optimizing route…"
+            : `Optimize route from my location (${stops.length} stops)`}
+        </button>
+
         {stops.length ? (
           <div className="stop-list">
             {stops.map((stop, index) => (
@@ -811,25 +1388,41 @@ export default function Tracker() {
                     {stop.name || `Delivery stop ${stops.length - index}`}
                   </strong>
                   <span>{stop.address}</span>
-                  {stop.barcode && <small>Barcode: {stop.barcode}</small>}
+                  {stop.description && (
+                    <span className="stop-description">
+                      Package: {stop.description}
+                    </span>
+                  )}
                 </div>
 
-                <a
-                  className="navigate-button"
-                  href={googleMapsUrl(stop.address)}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  Navigate <span>↗</span>
-                </a>
+                <div className="stop-actions">
+                  <a
+                    className="navigate-button"
+                    href={googleMapsUrl(stop.address)}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Navigate <span>↗</span>
+                  </a>
 
-                <button
-                  className="complete-button"
-                  onClick={() => completeStop(stop.id)}
-                  title="Mark this delivery complete"
-                >
-                  ✓
-                </button>
+                  <button
+                    className="complete-button"
+                    onClick={() => completeStop(stop.id)}
+                    title="Mark this delivery complete"
+                    aria-label={`Complete ${stop.name || stop.address}`}
+                  >
+                    ✓
+                  </button>
+
+                  <button
+                    className="delete-button"
+                    onClick={() => deleteStop(stop.id)}
+                    title="Delete this stop"
+                    aria-label={`Delete ${stop.name || stop.address}`}
+                  >
+                    ×
+                  </button>
+                </div>
               </article>
             ))}
           </div>
@@ -858,15 +1451,30 @@ export default function Tracker() {
                   <div className="stop-details">
                     <strong>{stop.name || "Delivery stop"}</strong>
                     <span>{stop.address}</span>
-                    {stop.barcode && <small>Barcode: {stop.barcode}</small>}
+                    {stop.description && (
+                      <span className="stop-description">
+                        Package: {stop.description}
+                      </span>
+                    )}
                   </div>
 
-                  <button
-                    className="undo-button"
-                    onClick={() => undoStop(stop.id)}
-                  >
-                    Undo
-                  </button>
+                  <div className="stop-actions">
+                    <button
+                      className="undo-button"
+                      onClick={() => undoStop(stop.id)}
+                    >
+                      Undo
+                    </button>
+
+                    <button
+                      className="delete-button"
+                      onClick={() => deleteStop(stop.id, true)}
+                      title="Delete completed stop"
+                      aria-label={`Delete ${stop.name || stop.address}`}
+                    >
+                      ×
+                    </button>
+                  </div>
                 </article>
               ))
             ) : (
