@@ -45,6 +45,11 @@ declare global {
   }
 }
 
+/**
+ * Loads Google Places once and reuses the in-flight request.
+ * Polls for importLibrary rather than assuming script.onload
+ * means the Google Maps API is ready.
+ */
 function loadGooglePlaces(): Promise<any> {
   if (typeof window === "undefined") {
     return Promise.reject(new Error("Google Places requires a browser."));
@@ -62,60 +67,105 @@ function loadGooglePlaces(): Promise<any> {
 
   if (!key) {
     return Promise.reject(
-      new Error("Add NEXT_PUBLIC_GOOGLE_MAPS_API_KEY to your .env.local file."),
+      new Error("Missing NEXT_PUBLIC_GOOGLE_MAPS_API_KEY."),
     );
   }
 
   window.__routepinGooglePromise = new Promise((resolve, reject) => {
-    const existing = document.querySelector(
+    let settled = false;
+    let timeoutId: number | undefined;
+    let pollId: number | undefined;
+
+    const cleanup = () => {
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+
+      if (pollId !== undefined) {
+        window.clearInterval(pollId);
+      }
+    };
+
+    const fail = (error: Error) => {
+      if (settled) return;
+
+      settled = true;
+      cleanup();
+      window.__routepinGooglePromise = undefined;
+      reject(error);
+    };
+
+    const finish = async () => {
+      if (settled) return;
+
+      if (!window.google?.maps?.importLibrary) {
+        return;
+      }
+
+      try {
+        const places = await window.google.maps.importLibrary("places");
+
+        if (settled) return;
+
+        settled = true;
+        cleanup();
+        resolve(places);
+      } catch (error) {
+        fail(
+          error instanceof Error
+            ? error
+            : new Error("Google Places initialization failed."),
+        );
+      }
+    };
+
+    const existingScript = document.querySelector(
       'script[data-routepin-google="true"]',
     ) as HTMLScriptElement | null;
 
-    const finish = async () => {
-      try {
-        if (!window.google?.maps?.importLibrary) {
-          throw new Error("Google Maps JavaScript API did not initialize.");
-        }
+    const script = existingScript ?? document.createElement("script");
 
-        resolve(await window.google.maps.importLibrary("places"));
-      } catch (error) {
-        window.__routepinGooglePromise = undefined;
-        reject(error);
-      }
-    };
+    if (!existingScript) {
+      script.dataset.routepinGoogle = "true";
+      script.src =
+        "https://maps.googleapis.com/maps/api/js" +
+        `?key=${encodeURIComponent(key)}` +
+        "&v=weekly&loading=async";
+      script.async = true;
+      script.defer = true;
+    }
 
-    if (existing) {
-      existing.addEventListener("load", finish, { once: true });
-      existing.addEventListener(
-        "error",
-        () => {
-          window.__routepinGooglePromise = undefined;
-          reject(new Error("Could not load Google Maps."));
-        },
-        { once: true },
+    timeoutId = window.setTimeout(() => {
+      fail(
+        new Error(
+          "Google Maps timed out. Check the Console for Google Maps API errors.",
+        ),
       );
+    }, 20000);
 
+    pollId = window.setInterval(() => {
       if (window.google?.maps?.importLibrary) {
         void finish();
       }
+    }, 100);
 
-      return;
+    script.addEventListener(
+      "error",
+      () => {
+        fail(
+          new Error(
+            "Google Maps script failed to load. Check your API key and website restrictions.",
+          ),
+        );
+      },
+      { once: true },
+    );
+
+    if (!existingScript) {
+      document.head.appendChild(script);
     }
 
-    const script = document.createElement("script");
-    script.dataset.routepinGoogle = "true";
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(
-      key,
-    )}&v=weekly&loading=async`;
-    script.async = true;
-    script.defer = true;
-    script.onload = () => void finish();
-    script.onerror = () => {
-      window.__routepinGooglePromise = undefined;
-      reject(new Error("Could not load Google Maps. Check your API key."));
-    };
-
-    document.head.appendChild(script);
+    void finish();
   });
 
   return window.__routepinGooglePromise;
@@ -172,7 +222,9 @@ function parseFedExPayload(raw: string): FedExDetails | null {
     /^(?:10Z|12Z|18Z|31Z|32Z|34Z)/i.test(value),
   );
 
-  if (!address && !weight && references.length === 0) return null;
+  if (!address && !weight && references.length === 0) {
+    return null;
+  }
 
   return { address, name, postalCode, weight, references };
 }
@@ -198,7 +250,6 @@ export default function Tracker() {
   const [message, setMessage] = useState("");
   const [scannerOpen, setScannerOpen] = useState(false);
   const [showCompleted, setShowCompleted] = useState(false);
-
   const [suggestions, setSuggestions] = useState<AddressSuggestion[]>([]);
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const [placesReady, setPlacesReady] = useState(false);
@@ -212,7 +263,6 @@ export default function Tracker() {
 
   const placesSessionRef = useRef<any>(null);
   const suggestionRequestRef = useRef(0);
-  const addressInputRef = useRef<HTMLTextAreaElement>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
@@ -220,7 +270,7 @@ export default function Tracker() {
   const hasScannedRef = useRef(false);
   const scannerStartingRef = useRef(false);
 
-  // Restore old and new saved stops. Older stops get an empty description.
+  // Restore saved stops from local storage.
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
@@ -243,7 +293,7 @@ export default function Tracker() {
     }
   }, []);
 
-  // Persist active and completed stops.
+  // Persist stop changes.
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ stops, completed }));
@@ -252,7 +302,7 @@ export default function Tracker() {
     }
   }, [stops, completed]);
 
-  // Load Google's Places library.
+  // Initialize Google Places.
   useEffect(() => {
     let cancelled = false;
 
@@ -261,11 +311,13 @@ export default function Tracker() {
         if (!cancelled) setPlacesReady(true);
       })
       .catch((error) => {
+        console.error("Google Places initialization failed:", error);
+
         if (!cancelled) {
           setMessage(
             error instanceof Error
               ? error.message
-              : "Google address suggestions could not be loaded.",
+              : "Google Places could not be initialized.",
           );
         }
       });
@@ -275,7 +327,7 @@ export default function Tracker() {
     };
   }, []);
 
-  // Request address suggestions after the user pauses typing.
+  // Fetch autocomplete suggestions while typing.
   useEffect(() => {
     const query = address.trim();
     const requestId = ++suggestionRequestRef.current;
@@ -283,7 +335,6 @@ export default function Tracker() {
     if (
       !placesReady ||
       !suggestionsOpen ||
-      !query ||
       query.length < 3 ||
       selectedPlaceRef.current?.address === query
     ) {
@@ -295,38 +346,48 @@ export default function Tracker() {
       try {
         const places = await loadGooglePlaces();
 
-        if (requestId !== suggestionRequestRef.current) return;
-
-        if (!placesSessionRef.current) {
-          placesSessionRef.current =
-            new window.google.maps.places.AutocompleteSessionToken();
+        if (requestId !== suggestionRequestRef.current) {
+          return;
         }
 
-        const { suggestions: results } =
+        if (!placesSessionRef.current) {
+          placesSessionRef.current = new places.AutocompleteSessionToken();
+        }
+
+        const response =
           await places.AutocompleteSuggestion.fetchAutocompleteSuggestions({
             input: query,
             includedRegionCodes: ["ca"],
             sessionToken: placesSessionRef.current,
           });
 
-        if (requestId !== suggestionRequestRef.current) return;
+        if (requestId !== suggestionRequestRef.current) {
+          return;
+        }
 
         setSuggestions(
-          (results ?? [])
-            .filter((result: any) => result.placePrediction)
+          (response.suggestions ?? [])
+            .filter((item: any) => item.placePrediction)
             .slice(0, 5)
-            .map((result: any) => ({
+            .map((item: any) => ({
               id: [
-                result.placePrediction.placeId,
-                result.placePrediction.text?.toString(),
+                item.placePrediction.placeId,
+                item.placePrediction.text?.toString(),
               ].join("-"),
-              label: result.placePrediction.text?.toString() ?? "",
-              prediction: result.placePrediction,
+              label: item.placePrediction.text?.toString() ?? "",
+              prediction: item.placePrediction,
             })),
         );
-      } catch {
+      } catch (error) {
+        console.error("Google Places autocomplete failed:", error);
+
         if (requestId === suggestionRequestRef.current) {
           setSuggestions([]);
+          setMessage(
+            error instanceof Error
+              ? `Address suggestions failed: ${error.message}`
+              : "Address suggestions could not be loaded.",
+          );
         }
       }
     }, 450);
@@ -370,6 +431,8 @@ export default function Tracker() {
       placesSessionRef.current = null;
       setMessage("Address selected. Confirm the details and add the stop.");
     } catch (error) {
+      console.error("Could not select Google address:", error);
+
       setMessage(
         error instanceof Error
           ? error.message
@@ -397,7 +460,7 @@ export default function Tracker() {
     };
   }, []);
 
-  // Fast PDF417 scanning, optimized for a phone's rear camera.
+  // PDF417 package scanner.
   const scanBarcode = async () => {
     if (scannerStartingRef.current || scannerOpen) return;
 
@@ -408,8 +471,8 @@ export default function Tracker() {
 
     try {
       const { BrowserMultiFormatReader } = await import("@zxing/browser");
-      const hints = new Map<DecodeHintType, unknown>();
 
+      const hints = new Map<DecodeHintType, unknown>();
       hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]);
 
       const reader = new BrowserMultiFormatReader(hints, {
@@ -431,15 +494,7 @@ export default function Tracker() {
 
       if (hasScannedRef.current) return;
 
-      const onDecode = (
-        result:
-          | {
-              getText: () => string;
-              getBarcodeFormat: () => unknown;
-            }
-          | undefined
-          | null,
-      ) => {
+      const onDecode = (result: any) => {
         if (!result || hasScannedRef.current) return;
 
         hasScannedRef.current = true;
@@ -516,7 +571,9 @@ export default function Tracker() {
           {
             audio: false,
             video: {
-              deviceId: { exact: fallbackDevice.deviceId },
+              deviceId: {
+                exact: fallbackDevice.deviceId,
+              },
               width: { ideal: 1280 },
               height: { ideal: 720 },
             },
@@ -567,7 +624,6 @@ export default function Tracker() {
       let lng: number;
       let displayAddress: string;
 
-      // A selected Google suggestion already contains precise coordinates.
       const selected = selectedPlaceRef.current;
 
       if (selected && selected.address === destination) {
@@ -575,10 +631,11 @@ export default function Tracker() {
         lng = selected.lng;
         displayAddress = selected.address;
       } else {
-        // Keep manual address entry working as a fallback.
         const response = await fetch(
           `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(destination)}`,
-          { headers: { "Accept-Language": "en-CA,en" } },
+          {
+            headers: { "Accept-Language": "en-CA,en" },
+          },
         );
 
         if (!response.ok) {
@@ -613,21 +670,15 @@ export default function Tracker() {
         createdAt: Date.now(),
       };
 
-      // Prevent duplicates even if two add operations overlap.
-      let added = true;
+      if (
+        stop.barcode &&
+        stops.some((existing) => existing.barcode === stop.barcode)
+      ) {
+        setMessage("That barcode is already on your active stop list.");
+        return;
+      }
 
-      setStops((current) => {
-        if (
-          stop.barcode &&
-          current.some((existing) => existing.barcode === stop.barcode)
-        ) {
-          added = false;
-          return current;
-        }
-
-        return [stop, ...current];
-      });
-
+      setStops((current) => [stop, ...current]);
       setAddress("");
       setBarcode("");
       setName("");
@@ -636,11 +687,7 @@ export default function Tracker() {
       placesSessionRef.current = null;
       setSuggestions([]);
       setSuggestionsOpen(false);
-      setMessage(
-        added
-          ? "Stop added to your map."
-          : "That barcode is already on your active stop list.",
-      );
+      setMessage("Stop added to your map.");
     } catch (error) {
       setMessage(
         error instanceof Error ? error.message : "Could not add this stop.",
@@ -651,25 +698,27 @@ export default function Tracker() {
   };
 
   const completeStop = (id: string) => {
-    const stop = stops.find((s) => s.id === id);
+    const stop = stops.find((item) => item.id === id);
     if (!stop) return;
 
-    setStops((current) => current.filter((s) => s.id !== id));
+    setStops((current) => current.filter((item) => item.id !== id));
     setCompleted((current) => [stop, ...current]);
     setMessage("Delivery marked complete.");
   };
 
   const undoStop = (id: string) => {
-    const stop = completed.find((s) => s.id === id);
+    const stop = completed.find((item) => item.id === id);
     if (!stop) return;
 
-    setCompleted((current) => current.filter((s) => s.id !== id));
+    setCompleted((current) => current.filter((item) => item.id !== id));
     setStops((current) => [stop, ...current]);
     setMessage("Delivery moved back to active stops.");
   };
 
   const deleteStop = (id: string, isCompleted = false) => {
-    const stop = (isCompleted ? completed : stops).find((s) => s.id === id);
+    const list = isCompleted ? completed : stops;
+    const stop = list.find((item) => item.id === id);
+
     if (!stop) return;
 
     if (!confirm(`Delete "${stop.name || stop.address}" from your tracker?`)) {
@@ -677,9 +726,9 @@ export default function Tracker() {
     }
 
     if (isCompleted) {
-      setCompleted((current) => current.filter((s) => s.id !== id));
+      setCompleted((current) => current.filter((item) => item.id !== id));
     } else {
-      setStops((current) => current.filter((s) => s.id !== id));
+      setStops((current) => current.filter((item) => item.id !== id));
     }
 
     setMessage("Stop deleted.");
@@ -715,10 +764,6 @@ export default function Tracker() {
         lng: position.coords.longitude,
       };
 
-      if (!stops.length) return;
-
-      // OSRM's trip service optimizes the order of stops along the road
-      // network, starting at the current location.
       const coordinates = [
         `${origin.lng},${origin.lat}`,
         ...stops.map((stop) => `${stop.lng},${stop.lat}`),
@@ -742,8 +787,6 @@ export default function Tracker() {
         );
       }
 
-      // OSRM waypoint_index is the position in the optimized trip.
-      // Input index 0 is our current location, not a delivery stop.
       const optimized = stops
         .map((stop, index) => ({
           stop,
@@ -756,10 +799,6 @@ export default function Tracker() {
         )
         .map((entry) => entry.stop);
 
-      if (optimized.some((stop) => !stop)) {
-        throw new Error("The route service returned an incomplete stop order.");
-      }
-
       setStops(optimized);
       setMessage(
         "Route optimized from your current location. Follow the reordered stop list.",
@@ -768,11 +807,19 @@ export default function Tracker() {
       let detail =
         error instanceof Error ? error.message : "Could not optimize route.";
 
-      if (error instanceof GeolocationPositionError) {
-        detail =
-          error.code === error.PERMISSION_DENIED
-            ? "Location permission was denied. Allow location access and try again."
-            : "Could not get your location. Check GPS/location settings and try again.";
+      if (typeof error === "object" && error !== null && "code" in error) {
+        const geoError = error as GeolocationPositionError;
+
+        if (geoError.code === geoError.PERMISSION_DENIED) {
+          detail =
+            "Location permission was denied. Allow location access and try again.";
+        } else if (
+          geoError.code === geoError.POSITION_UNAVAILABLE ||
+          geoError.code === geoError.TIMEOUT
+        ) {
+          detail =
+            "Could not get your location. Check GPS/location settings and try again.";
+        }
       }
 
       setMessage(detail);
@@ -1148,6 +1195,7 @@ export default function Tracker() {
 
           <div className="map-wrap">
             <MapView stops={stops} onComplete={completeStop} />
+
             {!stops.length && (
               <div className="map-empty">
                 <div className="empty-icon">⌖</div>
@@ -1269,13 +1317,11 @@ export default function Tracker() {
             <label className="address-field">
               DELIVERY ADDRESS <b>*</b>
               <textarea
-                ref={addressInputRef}
                 required
                 value={address}
                 onChange={(e) => updateAddress(e.target.value)}
                 onFocus={() => setSuggestionsOpen(true)}
                 onBlur={() => {
-                  // Allow a suggestion click to complete before closing.
                   window.setTimeout(() => setSuggestionsOpen(false), 180);
                 }}
                 placeholder="Start typing a street address…"
@@ -1283,12 +1329,18 @@ export default function Tracker() {
                 autoComplete="off"
               />
               {suggestionsOpen && suggestions.length > 0 && (
-                <div className="address-suggestions" role="listbox">
+                <div
+                  className="address-suggestions"
+                  role="listbox"
+                  aria-label="Address suggestions"
+                >
                   {suggestions.map((suggestion) => (
                     <button
                       key={suggestion.id}
                       type="button"
                       className="suggestion-button"
+                      role="option"
+                      aria-selected={false}
                       onMouseDown={(e) => e.preventDefault()}
                       onClick={() => void selectSuggestion(suggestion)}
                     >
@@ -1297,6 +1349,7 @@ export default function Tracker() {
                       </span>
                     </button>
                   ))}
+
                   <div className="suggestion-caption">
                     Google Maps address suggestions
                   </div>
@@ -1388,6 +1441,7 @@ export default function Tracker() {
                     {stop.name || `Delivery stop ${stops.length - index}`}
                   </strong>
                   <span>{stop.address}</span>
+
                   {stop.description && (
                     <span className="stop-description">
                       Package: {stop.description}
@@ -1451,6 +1505,7 @@ export default function Tracker() {
                   <div className="stop-details">
                     <strong>{stop.name || "Delivery stop"}</strong>
                     <span>{stop.address}</span>
+
                     {stop.description && (
                       <span className="stop-description">
                         Package: {stop.description}
