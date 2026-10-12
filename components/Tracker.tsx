@@ -31,13 +31,6 @@ const MapView = dynamic(() => import("./MapView"), {
 
 const STORAGE_KEY = "routepin-stops-v1";
 
-/**
- * Parse the FedEx structured barcode payload.
- * Separators include:
- * GS = \x1d
- * RS = \x1e
- * FS = \x1c
- */
 function parseFedExPayload(raw: string): FedExDetails | null {
   if (!raw.includes("[)>")) return null;
 
@@ -90,7 +83,6 @@ function parseFedExPayload(raw: string): FedExDetails | null {
     /^(?:10Z|12Z|18Z|31Z|32Z|34Z)/i.test(value),
   );
 
-  // Keep useful decoded package details even when address extraction fails.
   if (!address && !weight && references.length === 0) {
     return null;
   }
@@ -113,16 +105,17 @@ export default function Tracker() {
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
   const controlsRef = useRef<{ stop: () => void } | null>(null);
   const hasScannedRef = useRef(false);
+  const scannerStartingRef = useRef(false);
 
-  // Restore stops saved on this device.
+  // Restore saved stops after mounting.
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
 
       if (saved) {
         const parsed = JSON.parse(saved);
-        setStops(parsed.stops || []);
-        setCompleted(parsed.completed || []);
+        setStops(Array.isArray(parsed.stops) ? parsed.stops : []);
+        setCompleted(Array.isArray(parsed.completed) ? parsed.completed : []);
       }
     } catch {
       // Ignore malformed local data.
@@ -139,59 +132,52 @@ export default function Tracker() {
   }, [stops, completed]);
 
   const stopScanner = useCallback(() => {
+    hasScannedRef.current = true;
     controlsRef.current?.stop();
     controlsRef.current = null;
-    hasScannedRef.current = true;
+    scannerStartingRef.current = false;
     setScannerOpen(false);
   }, []);
 
   useEffect(() => {
     return () => {
+      hasScannedRef.current = true;
       controlsRef.current?.stop();
       controlsRef.current = null;
+      scannerStartingRef.current = false;
     };
   }, []);
 
-  // Start a PDF417-first camera scanner.
+  // Fast PDF417 scanning, optimized for a phone's rear camera.
   const scanBarcode = async () => {
-    setMessage("");
+    if (scannerStartingRef.current || scannerOpen) return;
+
+    scannerStartingRef.current = true;
     hasScannedRef.current = false;
+    setMessage("");
     setScannerOpen(true);
 
     try {
       const { BrowserMultiFormatReader } = await import("@zxing/browser");
 
+      // FedEx structured shipping labels commonly use PDF417.
+      // Limiting formats avoids checking unrelated barcode formats.
       const hints = new Map<DecodeHintType, unknown>();
 
-      hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-        BarcodeFormat.PDF_417,
-        BarcodeFormat.CODE_128,
-        BarcodeFormat.DATA_MATRIX,
-        BarcodeFormat.QR_CODE,
-      ]);
+      hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]);
 
+      // Retry frequently after unsuccessful decode attempts.
       const reader = new BrowserMultiFormatReader(hints, {
-        delayBetweenScanAttempts: 250,
+        delayBetweenScanAttempts: 100,
       });
+
       readerRef.current = reader;
 
-      const devices = await BrowserMultiFormatReader.listVideoInputDevices();
-
-      if (!devices.length) {
-        throw new Error(
-          "No camera found. Check your device or enter the barcode manually.",
-        );
-      }
-
-      const preferred = devices.find((device) =>
-        /back|rear|environment/i.test(device.label),
-      );
-
-      // Wait briefly for React to mount the camera preview.
+      // Wait for React to mount the video element.
       let video = videoRef.current;
 
-      for (let attempt = 0; !video && attempt < 10; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+      for (let attempt = 0; !video && attempt < 20; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
         video = videoRef.current;
       }
 
@@ -199,62 +185,107 @@ export default function Tracker() {
         throw new Error("Camera preview could not be initialized.");
       }
 
-      controlsRef.current = await reader.decodeFromConstraints(
-        {
-          audio: false,
-          video: {
-            deviceId: preferred ? { exact: preferred.deviceId } : undefined,
-            facingMode: preferred ? undefined : { ideal: "environment" },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
+      if (hasScannedRef.current) return;
+
+      const onDecode = (
+        result:
+          | {
+              getText: () => string;
+              getBarcodeFormat: () => unknown;
+            }
+          | undefined
+          | null,
+      ) => {
+        if (!result || hasScannedRef.current) return;
+
+        // Lock immediately so the same frame cannot be processed twice.
+        hasScannedRef.current = true;
+
+        const raw = result.getText();
+        const format = String(result.getBarcodeFormat());
+        const parsed = parseFedExPayload(raw);
+
+        setBarcode(raw);
+
+        if (parsed) {
+          if (parsed.address) setAddress(parsed.address);
+          if (parsed.name) setName(parsed.name);
+
+          const extraDetails = [
+            parsed.postalCode && `Postal code: ${parsed.postalCode}`,
+            parsed.weight && `Weight: ${parsed.weight}`,
+            parsed.references.length > 0 &&
+              `References: ${parsed.references.join(", ")}`,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+
+          setMessage(
+            `${format} barcode decoded. ${
+              parsed.address
+                ? "Address extracted. Confirm it before adding the stop."
+                : "Package details found, but enter the delivery address manually."
+            }${extraDetails ? ` ${extraDetails}` : ""}`,
+          );
+        } else {
+          setMessage(
+            `${format} barcode decoded, but the FedEx address format was not recognized. The decoded data has been captured; enter the delivery address manually.`,
+          );
+        }
+
+        controlsRef.current?.stop();
+        controlsRef.current = null;
+        scannerStartingRef.current = false;
+        setScannerOpen(false);
+      };
+
+      try {
+        // Prefer the iPhone's rear-facing camera.
+        controlsRef.current = await reader.decodeFromConstraints(
+          {
+            audio: false,
+            video: {
+              facingMode: { ideal: "environment" },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
           },
-        },
-        video,
-        (result) => {
-          if (!result || hasScannedRef.current) return;
+          video,
+          onDecode,
+        );
+      } catch (primaryError) {
+        if (hasScannedRef.current) return;
 
-          hasScannedRef.current = true;
+        // Fallback for browsers that cannot satisfy the preferred constraints.
+        const devices = await BrowserMultiFormatReader.listVideoInputDevices();
 
-          const raw = result.getText();
-          const format = String(result.getBarcodeFormat());
-          const parsed = parseFedExPayload(raw);
+        if (!devices.length) {
+          throw primaryError;
+        }
 
-          setBarcode(raw);
+        const preferred = devices.find((device) =>
+          /back|rear|environment/i.test(device.label),
+        );
 
-          if (parsed) {
-            if (parsed.address) setAddress(parsed.address);
-            if (parsed.name) setName(parsed.name);
+        const fallbackDevice = preferred ?? devices[devices.length - 1];
 
-            const extraDetails = [
-              parsed.postalCode && `Postal code: ${parsed.postalCode}`,
-              parsed.weight && `Weight: ${parsed.weight}`,
-              parsed.references.length > 0 &&
-                `References: ${parsed.references.join(", ")}`,
-            ]
-              .filter(Boolean)
-              .join(" · ");
-
-            setMessage(
-              `${format} barcode decoded. ${
-                parsed.address
-                  ? "Address extracted. Confirm it before adding the stop."
-                  : "Package details found, but enter the delivery address manually."
-              }${extraDetails ? ` ${extraDetails}` : ""}`,
-            );
-          } else {
-            setMessage(
-              `${format} barcode decoded, but the FedEx address format was not recognized. The decoded data has been captured; enter the delivery address manually.`,
-            );
-          }
-
-          controlsRef.current?.stop();
-          controlsRef.current = null;
-          setScannerOpen(false);
-        },
-      );
+        controlsRef.current = await reader.decodeFromConstraints(
+          {
+            audio: false,
+            video: {
+              deviceId: { exact: fallbackDevice.deviceId },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+          },
+          video,
+          onDecode,
+        );
+      }
     } catch (error) {
       controlsRef.current?.stop();
       controlsRef.current = null;
+      scannerStartingRef.current = false;
       setScannerOpen(false);
 
       setMessage(
@@ -270,11 +301,21 @@ export default function Tracker() {
 
     const parsed = parseFedExPayload(barcode);
     const destination = address.trim() || parsed?.address || "";
+    const normalizedBarcode = barcode.trim();
 
     if (!destination) {
       setMessage(
         "No delivery address was detected. Enter the complete address manually.",
       );
+      return;
+    }
+
+    // Check existing active stops before making a network request.
+    if (
+      normalizedBarcode &&
+      stops.some((stop) => stop.barcode.trim() === normalizedBarcode)
+    ) {
+      setMessage("That barcode is already on your active stop list.");
       return;
     }
 
@@ -307,17 +348,23 @@ export default function Tracker() {
         id: crypto.randomUUID(),
         name: name.trim() || parsed?.name || "",
         address: hit.display_name || destination,
-        barcode: barcode.trim(),
+        barcode: normalizedBarcode,
         lat: Number(hit.lat),
         lng: Number(hit.lon),
         createdAt: Date.now(),
       };
 
-      if (stop.barcode && stops.some((s) => s.barcode === stop.barcode)) {
-        throw new Error("That barcode is already on your active stop list.");
-      }
+      setStops((current) => {
+        if (
+          stop.barcode &&
+          current.some((existing) => existing.barcode === stop.barcode)
+        ) {
+          return current;
+        }
 
-      setStops((current) => [stop, ...current]);
+        return [stop, ...current];
+      });
+
       setAddress("");
       setBarcode("");
       setName("");
@@ -374,7 +421,6 @@ export default function Tracker() {
 
   return (
     <main className="app-shell">
-      {/* Camera alignment styles are included here so no separate CSS edit is required. */}
       <style jsx>{`
         .camera-box {
           margin-top: 14px;
@@ -470,6 +516,18 @@ export default function Tracker() {
           font-size: 13px;
           line-height: 1.5;
           text-align: center;
+        }
+
+        @media (max-width: 480px) {
+          .scan-frame {
+            width: 92%;
+            height: 40%;
+          }
+
+          .corner {
+            width: 20px;
+            height: 20px;
+          }
         }
       `}</style>
 
@@ -713,8 +771,8 @@ export default function Tracker() {
           <div className="privacy-note">
             <span>ⓘ</span>
             <p>
-              PDF417 and other supported barcodes are decoded in your browser.
-              Always confirm the delivery address before adding a stop.
+              PDF417 barcodes are decoded in your browser. Always confirm the
+              delivery address before adding a stop.
             </p>
           </div>
         </aside>
