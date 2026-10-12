@@ -7,125 +7,1547 @@ import type { BrowserMultiFormatReader } from "@zxing/browser";
 import { googleMapsUrl } from "../lib/maps";
 
 export type Stop = {
-  id: string; name: string; address: string; barcode: string; lat: number; lng: number;
-  createdAt: number; description: string; photoId?: string;
+  id: string;
+  name: string;
+  address: string;
+  barcode: string;
+  lat: number;
+  lng: number;
+  createdAt: number;
+  description: string;
 };
-type AddressSuggestion = { id: string; label: string; prediction: any };
-type RoutePoint = { lat: number; lng: number };
-const STATION: RoutePoint = { lat: 45.2791694, lng: -75.8085255 }; // Approximate geocoded pin for 985 Moodie Drive.
-const STATION_ADDRESS = "985 Moodie Drive, Nepean, ON, Canada";
-const MapView = dynamic(() => import("./MapView"), { ssr: false, loading: () => <div className="map-loading">Preparing your map…</div> });
+
+type FedExDetails = {
+  address: string;
+  name: string;
+  postalCode: string;
+  weight: string;
+  references: string[];
+};
+
+type AddressSuggestion = {
+  id: string;
+  label: string;
+  prediction: any;
+};
+
+const MapView = dynamic(() => import("./MapView"), {
+  ssr: false,
+  loading: () => <div className="map-loading">Preparing your map…</div>,
+});
+
 const STORAGE_KEY = "routepin-stops-v1";
-const PHOTO_DB = "routepin-photo-db";
-const PHOTO_STORE = "package-photos";
 
-declare global { interface Window { google?: any; __routepinGooglePromise?: Promise<any> } }
+declare global {
+  interface Window {
+    google?: any;
+    __routepinGooglePromise?: Promise<any>;
+  }
+}
 
+/**
+ * Loads Google Places once and reuses the in-flight request.
+ * Polls for importLibrary rather than assuming script.onload
+ * means the Google Maps API is ready.
+ */
 function loadGooglePlaces(): Promise<any> {
-  if (typeof window === "undefined") return Promise.reject(new Error("Google Places requires a browser."));
-  if (window.google?.maps?.importLibrary) return window.google.maps.importLibrary("places");
-  if (window.__routepinGooglePromise) return window.__routepinGooglePromise;
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("Google Places requires a browser."));
+  }
+
+  if (window.google?.maps?.importLibrary) {
+    return window.google.maps.importLibrary("places");
+  }
+
+  if (window.__routepinGooglePromise) {
+    return window.__routepinGooglePromise;
+  }
+
   const key = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
-  if (!key) return Promise.reject(new Error("Missing NEXT_PUBLIC_GOOGLE_MAPS_API_KEY."));
+
+  if (!key) {
+    return Promise.reject(
+      new Error("Missing NEXT_PUBLIC_GOOGLE_MAPS_API_KEY."),
+    );
+  }
+
   window.__routepinGooglePromise = new Promise((resolve, reject) => {
-    let done = false;
-    const timeout = window.setTimeout(() => { if (!done) { done = true; window.__routepinGooglePromise = undefined; reject(new Error("Google Maps timed out. Check API key restrictions and Console.")); } }, 20000);
-    const existing = document.querySelector('script[data-routepin-google="true"]') as HTMLScriptElement | null;
-    const script = existing ?? document.createElement("script");
-    const finish = async () => {
-      if (done || !window.google?.maps?.importLibrary) return;
-      try { const places = await window.google.maps.importLibrary("places"); if (!done) { done = true; window.clearTimeout(timeout); resolve(places); } }
-      catch (e) { if (!done) { done = true; window.clearTimeout(timeout); window.__routepinGooglePromise = undefined; reject(e); } }
+    let settled = false;
+    let timeoutId: number | undefined;
+    let pollId: number | undefined;
+
+    const cleanup = () => {
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+
+      if (pollId !== undefined) {
+        window.clearInterval(pollId);
+      }
     };
-    const poll = window.setInterval(() => { if (window.google?.maps?.importLibrary) { window.clearInterval(poll); void finish(); } }, 100);
-    if (!existing) { script.dataset.routepinGoogle = "true"; script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&v=weekly&loading=async`; script.async = true; script.defer = true; script.onerror = () => { window.clearInterval(poll); window.clearTimeout(timeout); window.__routepinGooglePromise = undefined; reject(new Error("Google Maps script failed to load.")); }; document.head.appendChild(script); }
+
+    const fail = (error: Error) => {
+      if (settled) return;
+
+      settled = true;
+      cleanup();
+      window.__routepinGooglePromise = undefined;
+      reject(error);
+    };
+
+    const finish = async () => {
+      if (settled) return;
+
+      if (!window.google?.maps?.importLibrary) {
+        return;
+      }
+
+      try {
+        const places = await window.google.maps.importLibrary("places");
+
+        if (settled) return;
+
+        settled = true;
+        cleanup();
+        resolve(places);
+      } catch (error) {
+        fail(
+          error instanceof Error
+            ? error
+            : new Error("Google Places initialization failed."),
+        );
+      }
+    };
+
+    const existingScript = document.querySelector(
+      'script[data-routepin-google="true"]',
+    ) as HTMLScriptElement | null;
+
+    const script = existingScript ?? document.createElement("script");
+
+    if (!existingScript) {
+      script.dataset.routepinGoogle = "true";
+      script.src =
+        "https://maps.googleapis.com/maps/api/js" +
+        `?key=${encodeURIComponent(key)}` +
+        "&v=weekly&loading=async";
+      script.async = true;
+      script.defer = true;
+    }
+
+    timeoutId = window.setTimeout(() => {
+      fail(
+        new Error(
+          "Google Maps timed out. Check the Console for Google Maps API errors.",
+        ),
+      );
+    }, 20000);
+
+    pollId = window.setInterval(() => {
+      if (window.google?.maps?.importLibrary) {
+        void finish();
+      }
+    }, 100);
+
+    script.addEventListener(
+      "error",
+      () => {
+        fail(
+          new Error(
+            "Google Maps script failed to load. Check your API key and website restrictions.",
+          ),
+        );
+      },
+      { once: true },
+    );
+
+    if (!existingScript) {
+      document.head.appendChild(script);
+    }
+
     void finish();
   });
+
   return window.__routepinGooglePromise;
 }
-function openPhotoDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(PHOTO_DB, 1);
-    request.onupgradeneeded = () => { if (!request.result.objectStoreNames.contains(PHOTO_STORE)) request.result.createObjectStore(PHOTO_STORE); };
-    request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
-  });
-}
-async function savePhoto(id: string, blob: Blob): Promise<void> {
-  const db = await openPhotoDb();
-  await new Promise<void>((resolve, reject) => { const tx = db.transaction(PHOTO_STORE, "readwrite"); tx.objectStore(PHOTO_STORE).put(blob, id); tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); }); db.close();
-}
-async function getPhoto(id: string): Promise<Blob | undefined> {
-  const db = await openPhotoDb();
-  const result = await new Promise<Blob | undefined>((resolve, reject) => { const req = db.transaction(PHOTO_STORE, "readonly").objectStore(PHOTO_STORE).get(id); req.onsuccess = () => resolve(req.result as Blob | undefined); req.onerror = () => reject(req.error); }); db.close(); return result;
-}
-async function deletePhotos(ids: string[]): Promise<void> {
-  if (!ids.length || typeof indexedDB === "undefined") return;
-  const db = await openPhotoDb();
-  await new Promise<void>((resolve, reject) => { const tx = db.transaction(PHOTO_STORE, "readwrite"); ids.forEach(id => tx.objectStore(PHOTO_STORE).delete(id)); tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); }); db.close();
-}
-function parseFedExPayload(raw: string): { address: string; name: string } | null {
+
+function parseFedExPayload(raw: string): FedExDetails | null {
   if (!raw.includes("[)>")) return null;
-  const fields = raw.split(/[\x1d\x1e\x1c]/).map(v => v.trim()).filter(Boolean);
-  const postalField = fields.find(v => /^02[A-Z]\d[A-Z]\s?\d[A-Z]\d$/i.test(v));
-  const postal = postalField?.slice(2).replace(/\s+/g, "").toUpperCase().replace(/^(.{3})(.{3})$/, "$1 $2") ?? "";
-  const marker = fields.findIndex(v => v === "N");
-  if (marker < 0) return null;
-  const after = fields.slice(marker + 1); const street = after[0] ?? ""; const city = after[1] ?? ""; const province = after[2] ?? ""; const name = after[3] ?? "";
-  const address = street && city && /^[A-Z]{2}$/i.test(province) ? [street, city, `${province.toUpperCase()}${postal ? ` ${postal}` : ""}`, "Canada"].join(", ") : "";
-  return address || name ? { address, name } : null;
+
+  const fields = raw
+    .split(/[\x1d\x1e\x1c]/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  const postalField = fields.find((value) =>
+    /^02[A-Z]\d[A-Z]\s?\d[A-Z]\d$/i.test(value),
+  );
+
+  const postalCode = postalField
+    ? postalField
+        .slice(2)
+        .replace(/\s+/g, "")
+        .toUpperCase()
+        .replace(/^(.{3})(.{3})$/, "$1 $2")
+    : "";
+
+  const markerIndex = fields.findIndex((value) => value === "N");
+
+  let address = "";
+  let name = "";
+
+  if (markerIndex >= 0) {
+    const afterMarker = fields.slice(markerIndex + 1);
+    const street = afterMarker[0] ?? "";
+    const city = afterMarker[1] ?? "";
+    const province = afterMarker[2] ?? "";
+    const recipient = afterMarker[3] ?? "";
+
+    if (street && city && /^[A-Z]{2}$/i.test(province) && recipient) {
+      address = [
+        street,
+        city,
+        `${province.toUpperCase()}${postalCode ? ` ${postalCode}` : ""}`,
+        "Canada",
+      ].join(", ");
+
+      name = recipient;
+    }
+  }
+
+  const weight =
+    fields.find((value) => /^\d+(?:\.\d+)?\s?(?:LB|KG)$/i.test(value)) ?? "";
+
+  const references = fields.filter((value) =>
+    /^(?:10Z|12Z|18Z|31Z|32Z|34Z)/i.test(value),
+  );
+
+  if (!address && !weight && references.length === 0) {
+    return null;
+  }
+
+  return { address, name, postalCode, weight, references };
 }
-function normalizeStop(s: any): Stop { return { ...s, name: typeof s.name === "string" ? s.name : "", address: typeof s.address === "string" ? s.address : "", barcode: typeof s.barcode === "string" ? s.barcode : "", description: typeof s.description === "string" ? s.description : "" }; }
+
+function normalizeStop(stop: any): Stop {
+  return {
+    ...stop,
+    description: typeof stop.description === "string" ? stop.description : "",
+    name: typeof stop.name === "string" ? stop.name : "",
+    address: typeof stop.address === "string" ? stop.address : "",
+    barcode: typeof stop.barcode === "string" ? stop.barcode : "",
+  };
+}
 
 export default function Tracker() {
-  const [stops, setStops] = useState<Stop[]>([]); const [completed, setCompleted] = useState<Stop[]>([]);
-  const [barcode, setBarcode] = useState(""); const [address, setAddress] = useState(""); const [name, setName] = useState(""); const [description, setDescription] = useState("");
-  const [busy, setBusy] = useState(false); const [message, setMessage] = useState(""); const [scannerOpen, setScannerOpen] = useState(false); const [showCompleted, setShowCompleted] = useState(false);
-  const [suggestions, setSuggestions] = useState<AddressSuggestion[]>([]); const [suggestionsOpen, setSuggestionsOpen] = useState(false); const [placesReady, setPlacesReady] = useState(false); const [optimizing, setOptimizing] = useState(false);
-  const [packagePhotos, setPackagePhotos] = useState<Record<string, string>>({}); const [photoFile, setPhotoFile] = useState<File | null>(null); const [draftPhotoUrl, setDraftPhotoUrl] = useState(""); const [routeGeometry, setRouteGeometry] = useState<[number, number][]>([]);
-  const selectedPlaceRef = useRef<{ address: string; lat: number; lng: number } | null>(null); const placesSessionRef = useRef<any>(null); const requestRef = useRef(0);
-  const videoRef = useRef<HTMLVideoElement>(null); const readerRef = useRef<BrowserMultiFormatReader | null>(null); const controlsRef = useRef<{ stop: () => void } | null>(null); const scannedRef = useRef(false); const scannerStartingRef = useRef(false);
-  useEffect(() => { try { const saved = localStorage.getItem(STORAGE_KEY); if (saved) { const p = JSON.parse(saved); setStops(Array.isArray(p.stops) ? p.stops.map(normalizeStop) : []); setCompleted(Array.isArray(p.completed) ? p.completed.map(normalizeStop) : []); } } catch {} }, []);
-  useEffect(() => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ stops, completed })); } catch { setMessage("Browser storage is full or unavailable. Photos are stored separately; consider clearing old stops."); } }, [stops, completed]);
-  useEffect(() => { let cancelled = false; loadGooglePlaces().then(() => { if (!cancelled) setPlacesReady(true); }).catch(e => { if (!cancelled) setMessage(e instanceof Error ? e.message : "Google Places unavailable."); }); return () => { cancelled = true; }; }, []);
-  useEffect(() => { let cancelled = false; const all = [...stops, ...completed]; (async () => { for (const stop of all) { if (!stop.photoId || packagePhotos[stop.id]) continue; try { const blob = await getPhoto(stop.photoId); if (blob && !cancelled) setPackagePhotos(prev => ({ ...prev, [stop.id]: URL.createObjectURL(blob) })); } catch {} } })(); return () => { cancelled = true; }; }, [stops, completed]);
-  useEffect(() => { const q = address.trim(); const id = ++requestRef.current; if (!placesReady || !suggestionsOpen || q.length < 3 || selectedPlaceRef.current?.address === q) { setSuggestions([]); return; } const timer = window.setTimeout(async () => { try { const places = await loadGooglePlaces(); if (id !== requestRef.current) return; placesSessionRef.current ??= new places.AutocompleteSessionToken(); const r = await places.AutocompleteSuggestion.fetchAutocompleteSuggestions({ input: q, includedRegionCodes: ["ca"], sessionToken: placesSessionRef.current }); if (id !== requestRef.current) return; setSuggestions((r.suggestions ?? []).filter((x: any) => x.placePrediction).slice(0, 5).map((x: any) => ({ id: x.placePrediction.placeId + "-" + x.placePrediction.text, label: x.placePrediction.text?.toString() ?? "", prediction: x.placePrediction }))); } catch { if (id === requestRef.current) setSuggestions([]); } }, 400); return () => window.clearTimeout(timer); }, [address, placesReady, suggestionsOpen]);
-  const selectSuggestion = async (s: AddressSuggestion) => { try { setBusy(true); const p = s.prediction.toPlace(); await p.fetchFields({ fields: ["formattedAddress", "location"] }); if (!p.location) throw new Error("Google did not return coordinates for this address."); const a = p.formattedAddress || s.label; selectedPlaceRef.current = { address: a, lat: p.location.lat(), lng: p.location.lng() }; setAddress(a); setSuggestions([]); setSuggestionsOpen(false); placesSessionRef.current = null; setMessage("Address selected. Confirm it before adding the stop."); } catch (e) { setMessage(e instanceof Error ? e.message : "Could not select address."); } finally { setBusy(false); } };
-  const stopScanner = useCallback(() => { scannedRef.current = true; controlsRef.current?.stop(); controlsRef.current = null; scannerStartingRef.current = false; setScannerOpen(false); }, []);
-  useEffect(() => () => { scannedRef.current = true; controlsRef.current?.stop(); }, []);
-  const scanBarcode = async () => { if (scannerStartingRef.current || scannerOpen) return; scannerStartingRef.current = true; scannedRef.current = false; setScannerOpen(true); setMessage(""); try { const { BrowserMultiFormatReader } = await import("@zxing/browser"); const hints = new Map<DecodeHintType, unknown>(); hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]); const reader = new BrowserMultiFormatReader(hints, { delayBetweenScanAttempts: 100 }); readerRef.current = reader; let video = videoRef.current; for (let i = 0; !video && i < 20; i++) { await new Promise(r => setTimeout(r, 50)); video = videoRef.current; } if (!video) throw new Error("Camera preview could not be initialized."); const onDecode = (result: any) => { if (!result || scannedRef.current) return; scannedRef.current = true; const raw = result.getText(); setBarcode(raw); const parsed = parseFedExPayload(raw); if (parsed?.address) { setAddress(parsed.address); selectedPlaceRef.current = null; } if (parsed?.name) setName(parsed.name); setMessage(parsed?.address ? "Barcode decoded. Confirm the extracted address." : "Barcode decoded. Enter or photograph the delivery address."); controlsRef.current?.stop(); controlsRef.current = null; scannerStartingRef.current = false; setScannerOpen(false); }; controlsRef.current = await reader.decodeFromConstraints({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } }, video, onDecode); } catch (e) { controlsRef.current?.stop(); controlsRef.current = null; scannerStartingRef.current = false; setScannerOpen(false); setMessage(e instanceof Error ? `Camera error: ${e.message}` : "Could not start camera."); } };
-  const readPhoto = async (file: File) => { if (draftPhotoUrl) URL.revokeObjectURL(draftPhotoUrl); setPhotoFile(file); setDraftPhotoUrl(URL.createObjectURL(file)); setMessage("Reading package label…"); try { const Tesseract = await import("tesseract.js"); const result = await Tesseract.recognize(file, "eng"); const text = result.data.text; const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean); const candidate = lines.filter(line => /\d/.test(line) && /[a-z]/i.test(line) && line.length >= 6).slice(0, 5).join(", "); if (candidate) { setAddress(candidate); selectedPlaceRef.current = null; setSuggestionsOpen(true); setMessage("Text extracted from the photo. OCR may be imperfect—edit the address and choose a map suggestion before adding."); } else setMessage("Photo saved for this draft, but an address wasn't confidently detected. Type the address manually."); } catch (e) { setMessage(`Could not read text from the photo. You can still add the image and type the address. ${e instanceof Error ? e.message : ""}`); } };
-  const addStop = async (e: React.FormEvent) => { e.preventDefault(); const destination = address.trim(); const code = barcode.trim(); if (!destination) { setMessage("Enter or extract a delivery address first."); return; } if (code && [...stops, ...completed].some(s => s.barcode.trim() === code)) { setMessage("That barcode is already saved."); return; } setBusy(true); setMessage("Checking address…"); try { let lat: number, lng: number, displayAddress: string; const selected = selectedPlaceRef.current; if (selected && selected.address === destination) { ({ lat, lng } = selected); displayAddress = selected.address; } else { const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(destination + ", Canada")}`, { headers: { "Accept-Language": "en-CA,en" } }); if (!r.ok) throw new Error("Address lookup failed. Select a Google suggestion or try again."); const data = await r.json(); if (!data.length) throw new Error("Address not found. Select a map suggestion or correct the address."); lat = Number(data[0].lat); lng = Number(data[0].lon); displayAddress = data[0].display_name || destination; } if (!Number.isFinite(lat) || !Number.isFinite(lng)) throw new Error("Invalid map coordinates."); const id = crypto.randomUUID(); const stop: Stop = { id, name: name.trim(), address: displayAddress, barcode: code, description: description.trim(), lat, lng, createdAt: Date.now(), ...(photoFile ? { photoId: id } : {}) }; if (photoFile) { await savePhoto(id, photoFile); setPackagePhotos(prev => ({ ...prev, [id]: URL.createObjectURL(photoFile) })); } setStops(prev => [stop, ...prev]); setAddress(""); setBarcode(""); setName(""); setDescription(""); setPhotoFile(null); if (draftPhotoUrl) URL.revokeObjectURL(draftPhotoUrl); setDraftPhotoUrl(""); selectedPlaceRef.current = null; placesSessionRef.current = null; setSuggestions([]); setSuggestionsOpen(false); setRouteGeometry([]); setMessage("Stop added with its package photo."); } catch (e) { setMessage(e instanceof Error ? e.message : "Could not add this stop."); } finally { setBusy(false); } };
-  const completeStop = (id: string) => { const stop = stops.find(s => s.id === id); if (!stop) return; setStops(prev => prev.filter(s => s.id !== id)); setCompleted(prev => [stop, ...prev]); setMessage("Delivery marked complete."); };
-  const undoStop = (id: string) => { const stop = completed.find(s => s.id === id); if (!stop) return; setCompleted(prev => prev.filter(s => s.id !== id)); setStops(prev => [stop, ...prev]); };
-  const removeStop = async (id: string, done = false) => { const list = done ? completed : stops; const stop = list.find(s => s.id === id); if (!stop || !confirm(`Delete “${stop.name || stop.address}”?`)) return; if (done) setCompleted(prev => prev.filter(s => s.id !== id)); else setStops(prev => prev.filter(s => s.id !== id)); if (stop.photoId) await deletePhotos([stop.photoId]); setPackagePhotos(prev => { const copy = { ...prev }; if (copy[id]) URL.revokeObjectURL(copy[id]); delete copy[id]; return copy; }); setMessage("Stop deleted."); };
-  const clearDay = async () => { if (!confirm("Delete ALL active and completed stops and package photos? This cannot be undone.")) return; const ids = [...stops, ...completed].map(s => s.photoId).filter((x): x is string => Boolean(x)); await deletePhotos(ids); Object.values(packagePhotos).forEach(URL.revokeObjectURL); setPackagePhotos({}); setStops([]); setCompleted([]); setRouteGeometry([]); setMessage("All stops and package photos cleared. Ready for a new shift."); };
-  const optimizeRoute = async () => { if (!stops.length) { setMessage("Add at least one stop before optimizing."); return; } setOptimizing(true); setMessage("Optimizing a round trip from the station…"); try { const coords = [`${STATION.lng},${STATION.lat}`, ...stops.map(s => `${s.lng},${s.lat}`)].join(";"); const url = `https://router.project-osrm.org/trip/v1/driving/${coords}?source=first&destination=first&roundtrip=true&overview=full&geometries=geojson`; const response = await fetch(url); if (!response.ok) throw new Error("Route service is temporarily unavailable."); const result = await response.json(); if (result.code !== "Ok" || !Array.isArray(result.waypoints) || !result.trips?.[0]) throw new Error("Could not create a drivable round trip. Check the stop addresses."); const ordered = stops.map((stop, i) => ({ stop, index: result.waypoints[i + 1]?.waypoint_index })).sort((a, b) => (a.index ?? 999999) - (b.index ?? 999999)).map(x => x.stop); setStops(ordered); const coordsOut = result.trips[0].geometry?.coordinates; setRouteGeometry(Array.isArray(coordsOut) ? coordsOut.map((p: number[]) => [p[1], p[0]] as [number, number]) : []); const seconds = result.trips[0].duration; const minutes = Number.isFinite(seconds) ? Math.round(seconds / 60) : null; const km = Number.isFinite(result.trips[0].distance) ? (result.trips[0].distance / 1000).toFixed(1) : null; setMessage(`Round trip optimized: station → ${stops.length} stops → station${minutes !== null ? ` · about ${Math.floor(minutes / 60)}h ${minutes % 60}m driving` : ""}${km ? ` · ${km} km` : ""}. No live traffic included.`); } catch (e) { setMessage(e instanceof Error ? e.message : "Could not optimize route."); } finally { setOptimizing(false); } };
-  const progress = useMemo(() => stops.length + completed.length ? Math.round(completed.length / (stops.length + completed.length) * 100) : 0, [stops.length, completed.length]);
-  const updateAddress = (v: string) => { setAddress(v); selectedPlaceRef.current = null; setSuggestionsOpen(true); };
+  const [stops, setStops] = useState<Stop[]>([]);
+  const [completed, setCompleted] = useState<Stop[]>([]);
+  const [barcode, setBarcode] = useState("");
+  const [address, setAddress] = useState("");
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const [showCompleted, setShowCompleted] = useState(false);
+  const [suggestions, setSuggestions] = useState<AddressSuggestion[]>([]);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [placesReady, setPlacesReady] = useState(false);
+  const [optimizing, setOptimizing] = useState(false);
 
-  return <main className="app-shell">
-    <header className="topbar"><a className="brand" href="#"><span className="brand-mark">R</span><span>route<span className="brand-accent">pin</span><small>DELIVERY STOP TRACKER</small></span></a><div className="topbar-right"><span className="privacy-dot" /> Saved on this device <button className="icon-button" title="Clear route" onClick={() => void clearDay()}>↺</button></div></header>
-    <section className="welcome"><div><div className="eyebrow">YOUR ROUTE, AT A GLANCE</div><h1>Make every stop <span>count.</span></h1><p>Photograph package labels, verify addresses, and return to your station.</p></div><div className="date-chip">● &nbsp; LIVE ROUTE</div></section>
-    <section className="stats-grid"><div className="stat-card active-stat"><div className="stat-label">REMAINING STOPS</div><div className="stat-number">{String(stops.length).padStart(2, "0")}</div><div className="stat-foot">Deliveries left</div></div><div className="stat-card"><div className="stat-label">COMPLETED</div><div className="stat-number">{String(completed.length).padStart(2, "0")}</div><div className="stat-foot">Stops finished today</div></div><div className="stat-card progress-card"><div className="stat-label">ROUTE PROGRESS</div><div className="progress-row"><div className="stat-number">{progress}<small>%</small></div></div><div className="progress-track"><span style={{ width: `${progress}%` }} /></div><div className="stat-foot">Shift progress</div></div></section>
-    <section className="workspace"><div className="map-panel"><div className="panel-heading"><div><h2>Stop map</h2><p>{stops.length ? `${stops.length} active stops · station round trip` : "Your station and stops will appear here"}</p></div><span className="map-legend"><i /> Active stop</span></div><div className="map-wrap"><MapView stops={stops} onComplete={completeStop} routeGeometry={routeGeometry} station={STATION} stationAddress={STATION_ADDRESS}/>{!stops.length && <div className="map-empty"><div className="empty-icon">⌖</div><strong>Station: 985 Moodie Drive</strong><span>Add your first package to build the route.</span></div>}</div><div className="map-footer"><span>Map data © OpenStreetMap contributors</span><span>Route returns to station</span></div></div>
-    <aside className="side-panel"><div className="panel-heading side-heading"><div><h2>Add a stop</h2><p>Photo first, barcode optional</p></div><span className="step-badge">01</span></div>
-      <label className="scan-button" style={{ cursor: "pointer" }}><span className="scan-icon">▧</span><span><strong>Take / upload package photo</strong><small>Address text will be read automatically</small></span><input type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={e => { const file = e.target.files?.[0]; if (file) void readPhoto(file); e.currentTarget.value = ""; }}/></label>
-      {photoFile && <div className="photo-preview"><img src={draftPhotoUrl} alt="Selected package label preview" style={{ maxWidth: "100%", maxHeight: 180, borderRadius: 10 }} /><button type="button" className="text-button" onClick={() => { setPhotoFile(null); if (draftPhotoUrl) URL.revokeObjectURL(draftPhotoUrl); setDraftPhotoUrl(""); setMessage("Draft photo removed."); }}>Remove draft photo</button></div>}
-      <button type="button" className={`scan-button ${scannerOpen ? "scanning" : ""}`} onClick={scannerOpen ? stopScanner : scanBarcode}><span className="scan-icon">▦</span><span><strong>{scannerOpen ? "Stop scanning" : "Scan package barcode"}</strong><small>{scannerOpen ? "Camera is active" : "Optional PDF417 scanner"}</small></span><span className="button-arrow">{scannerOpen ? "×" : "↗"}</span></button>
-      {scannerOpen && <div className="camera-box"><div className="camera-preview"><video ref={videoRef} autoPlay muted playsInline /></div><p className="scan-instructions">Align the full PDF417 barcode in the camera view.</p></div>}
-      <div className="or-divider"><span /> PACKAGE DETAILS <span /></div><form className="stop-form" onSubmit={addStop}>
-        <label>BARCODE / TRACKING NUMBER <span>OPTIONAL</span><input value={barcode} onChange={e => { setBarcode(e.target.value); const p = parseFedExPayload(e.target.value); if (p?.address) { setAddress(p.address); selectedPlaceRef.current = null; } if (p?.name) setName(p.name); }} placeholder="Scan or paste barcode data" /></label>
-        <label>RECIPIENT / STOP NAME <span>OPTIONAL</span><input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Smith residence" /></label>
-        <label>PACKAGE DESCRIPTION <span>OPTIONAL</span><input value={description} onChange={e => setDescription(e.target.value)} placeholder="e.g. Large box — behind passenger seat" /></label>
-        <label className="address-field">DELIVERY ADDRESS <b>*</b><textarea required value={address} onChange={e => updateAddress(e.target.value)} onFocus={() => setSuggestionsOpen(true)} onBlur={() => window.setTimeout(() => setSuggestionsOpen(false), 180)} placeholder="Type or correct the extracted address…" rows={3} autoComplete="off" />{suggestionsOpen && suggestions.length > 0 && <div className="address-suggestions" role="listbox">{suggestions.map(s => <button key={s.id} type="button" className="suggestion-button" onMouseDown={e => e.preventDefault()} onClick={() => void selectSuggestion(s)}>{s.label}</button>)}<div className="suggestion-caption">Google Maps address suggestions</div></div>}</label>
-        <button className="add-button" disabled={busy}>{busy ? "Working…" : "+ Add stop to map ↗"}</button>
-      </form>{message && <div className={`message ${/failed|could not|not found|already|error|unable/i.test(message) ? "message-error" : ""}`} role="status">{message}</div>}<div className="privacy-note"><span>ⓘ</span><p>OCR runs in your browser. Verify the address before saving. Package photos remain on this device.</p></div>
-    </aside></section>
-    <section className="stops-section"><div className="section-heading"><div><div className="eyebrow">YOUR DELIVERY LIST</div><h2>Stops to make <span className="count-pill">{stops.length}</span></h2><p>Start and finish at {STATION_ADDRESS}</p></div><button className="text-button" onClick={() => setShowCompleted(v => !v)}>{showCompleted ? "Hide completed" : `View completed (${completed.length})`} →</button></div>
-      <button type="button" className="optimize-button" disabled={optimizing || !stops.length} onClick={() => void optimizeRoute()}>{optimizing ? "◌ Optimizing round trip…" : `⌖ Optimize station round trip (${stops.length} stops)`}</button>
-      <button type="button" className="delete-all-button" style={{ width: "100%", margin: "0 0 14px", padding: "12px 14px", border: "1px solid #f1c9c9", borderRadius: 12, background: "#fff1f0", color: "#b42318", fontWeight: 700, cursor: "pointer" }} onClick={() => void clearDay()}>Delete All Stops &amp; Reset Shift</button>
-      {stops.length ? <div className="stop-list">{stops.map((stop, i) => <article className="stop-item" key={stop.id}><div className="stop-index">{String(i + 1).padStart(2, "0")}</div>{packagePhotos[stop.id] && <a href={packagePhotos[stop.id]} target="_blank" rel="noreferrer"><img src={packagePhotos[stop.id]} alt="Package label" style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 8 }} /></a>}<div className="stop-details"><strong>{stop.name || `Delivery stop ${i + 1}`}</strong><span>{stop.address}</span>{stop.description && <span className="stop-description">Package: {stop.description}</span>}</div><div className="stop-actions"><a className="navigate-button" href={googleMapsUrl(stop.address)} target="_blank" rel="noreferrer">Navigate ↗</a><button className="complete-button" onClick={() => completeStop(stop.id)} aria-label="Complete stop">✓</button><button className="delete-button" onClick={() => void removeStop(stop.id)} aria-label="Delete stop">×</button></div></article>)}</div> : <div className="list-empty"><span>✓</span><div><strong>No active stops</strong><p>Add a package to begin a new shift.</p></div></div>}
-      {showCompleted && <div className="completed-list"><div className="completed-title">COMPLETED DELIVERIES</div>{completed.length ? completed.map(stop => <article className="stop-item completed-item" key={stop.id}><div className="stop-index done">✓</div>{packagePhotos[stop.id] && <a href={packagePhotos[stop.id]} target="_blank" rel="noreferrer"><img src={packagePhotos[stop.id]} alt="Package label" style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 8 }} /></a>}<div className="stop-details"><strong>{stop.name || "Delivery stop"}</strong><span>{stop.address}</span>{stop.description && <span className="stop-description">Package: {stop.description}</span>}</div><div className="stop-actions"><button className="undo-button" onClick={() => undoStop(stop.id)}>Undo</button><button className="delete-button" onClick={() => void removeStop(stop.id, true)}>×</button></div></article>) : <p className="no-completed">No completed deliveries yet.</p>}</div>}
-    </section><footer className="footer"><span>ROUTEPIN <b>•</b> BUILT FOR THE ROAD</span><span>Photos and stop data are stored locally on this device.</span></footer>
-  </main>;
+  const selectedPlaceRef = useRef<{
+    address: string;
+    lat: number;
+    lng: number;
+  } | null>(null);
+
+  const placesSessionRef = useRef<any>(null);
+  const suggestionRequestRef = useRef(0);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const readerRef = useRef<BrowserMultiFormatReader | null>(null);
+  const controlsRef = useRef<{ stop: () => void } | null>(null);
+  const hasScannedRef = useRef(false);
+  const scannerStartingRef = useRef(false);
+
+  // Restore saved stops from local storage.
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+
+      if (saved) {
+        const parsed = JSON.parse(saved);
+
+        setStops(
+          Array.isArray(parsed.stops) ? parsed.stops.map(normalizeStop) : [],
+        );
+
+        setCompleted(
+          Array.isArray(parsed.completed)
+            ? parsed.completed.map(normalizeStop)
+            : [],
+        );
+      }
+    } catch {
+      // Ignore malformed local data.
+    }
+  }, []);
+
+  // Persist stop changes.
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ stops, completed }));
+    } catch {
+      // Storage may be unavailable.
+    }
+  }, [stops, completed]);
+
+  // Initialize Google Places.
+  useEffect(() => {
+    let cancelled = false;
+
+    loadGooglePlaces()
+      .then(() => {
+        if (!cancelled) setPlacesReady(true);
+      })
+      .catch((error) => {
+        console.error("Google Places initialization failed:", error);
+
+        if (!cancelled) {
+          setMessage(
+            error instanceof Error
+              ? error.message
+              : "Google Places could not be initialized.",
+          );
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Fetch autocomplete suggestions while typing.
+  useEffect(() => {
+    const query = address.trim();
+    const requestId = ++suggestionRequestRef.current;
+
+    if (
+      !placesReady ||
+      !suggestionsOpen ||
+      query.length < 3 ||
+      selectedPlaceRef.current?.address === query
+    ) {
+      setSuggestions([]);
+      return;
+    }
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const places = await loadGooglePlaces();
+
+        if (requestId !== suggestionRequestRef.current) {
+          return;
+        }
+
+        if (!placesSessionRef.current) {
+          placesSessionRef.current = new places.AutocompleteSessionToken();
+        }
+
+        const response =
+          await places.AutocompleteSuggestion.fetchAutocompleteSuggestions({
+            input: query,
+            includedRegionCodes: ["ca"],
+            sessionToken: placesSessionRef.current,
+          });
+
+        if (requestId !== suggestionRequestRef.current) {
+          return;
+        }
+
+        setSuggestions(
+          (response.suggestions ?? [])
+            .filter((item: any) => item.placePrediction)
+            .slice(0, 5)
+            .map((item: any) => ({
+              id: [
+                item.placePrediction.placeId,
+                item.placePrediction.text?.toString(),
+              ].join("-"),
+              label: item.placePrediction.text?.toString() ?? "",
+              prediction: item.placePrediction,
+            })),
+        );
+      } catch (error) {
+        console.error("Google Places autocomplete failed:", error);
+
+        if (requestId === suggestionRequestRef.current) {
+          setSuggestions([]);
+          setMessage(
+            error instanceof Error
+              ? `Address suggestions failed: ${error.message}`
+              : "Address suggestions could not be loaded.",
+          );
+        }
+      }
+    }, 450);
+
+    return () => window.clearTimeout(timer);
+  }, [address, placesReady, suggestionsOpen]);
+
+  const selectSuggestion = async (suggestion: AddressSuggestion) => {
+    try {
+      setBusy(true);
+      setMessage("Loading selected address…");
+      setSuggestionsOpen(false);
+      setSuggestions([]);
+
+      const place = suggestion.prediction.toPlace();
+
+      await place.fetchFields({
+        fields: ["formattedAddress", "location"],
+      });
+
+      const location = place.location;
+      const formattedAddress = place.formattedAddress || suggestion.label;
+
+      if (
+        !location ||
+        typeof location.lat !== "function" ||
+        typeof location.lng !== "function"
+      ) {
+        throw new Error(
+          "Google did not return coordinates for that address. Try another result.",
+        );
+      }
+
+      selectedPlaceRef.current = {
+        address: formattedAddress,
+        lat: location.lat(),
+        lng: location.lng(),
+      };
+
+      setAddress(formattedAddress);
+      placesSessionRef.current = null;
+      setMessage("Address selected. Confirm the details and add the stop.");
+    } catch (error) {
+      console.error("Could not select Google address:", error);
+
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Could not load the selected address.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stopScanner = useCallback(() => {
+    hasScannedRef.current = true;
+    controlsRef.current?.stop();
+    controlsRef.current = null;
+    scannerStartingRef.current = false;
+    setScannerOpen(false);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      hasScannedRef.current = true;
+      controlsRef.current?.stop();
+      controlsRef.current = null;
+      scannerStartingRef.current = false;
+    };
+  }, []);
+
+  // PDF417 package scanner.
+  const scanBarcode = async () => {
+    if (scannerStartingRef.current || scannerOpen) return;
+
+    scannerStartingRef.current = true;
+    hasScannedRef.current = false;
+    setMessage("");
+    setScannerOpen(true);
+
+    try {
+      const { BrowserMultiFormatReader } = await import("@zxing/browser");
+
+      const hints = new Map<DecodeHintType, unknown>();
+      hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]);
+
+      const reader = new BrowserMultiFormatReader(hints, {
+        delayBetweenScanAttempts: 100,
+      });
+
+      readerRef.current = reader;
+
+      let video = videoRef.current;
+
+      for (let attempt = 0; !video && attempt < 20; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        video = videoRef.current;
+      }
+
+      if (!video) {
+        throw new Error("Camera preview could not be initialized.");
+      }
+
+      if (hasScannedRef.current) return;
+
+      const onDecode = (result: any) => {
+        if (!result || hasScannedRef.current) return;
+
+        hasScannedRef.current = true;
+
+        const raw = result.getText();
+        const format = String(result.getBarcodeFormat());
+        const parsed = parseFedExPayload(raw);
+
+        setBarcode(raw);
+
+        if (parsed) {
+          if (parsed.address) {
+            setAddress(parsed.address);
+            selectedPlaceRef.current = null;
+          }
+
+          if (parsed.name) setName(parsed.name);
+
+          const extraDetails = [
+            parsed.postalCode && `Postal code: ${parsed.postalCode}`,
+            parsed.weight && `Weight: ${parsed.weight}`,
+            parsed.references.length > 0 &&
+              `References: ${parsed.references.join(", ")}`,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+
+          setMessage(
+            `${format} barcode decoded. ${
+              parsed.address
+                ? "Address extracted. Confirm it before adding the stop."
+                : "Package details found, but enter the delivery address manually."
+            }${extraDetails ? ` ${extraDetails}` : ""}`,
+          );
+        } else {
+          setMessage(
+            `${format} barcode decoded, but the FedEx address format was not recognized. Enter the delivery address manually.`,
+          );
+        }
+
+        controlsRef.current?.stop();
+        controlsRef.current = null;
+        scannerStartingRef.current = false;
+        setScannerOpen(false);
+      };
+
+      try {
+        controlsRef.current = await reader.decodeFromConstraints(
+          {
+            audio: false,
+            video: {
+              facingMode: { ideal: "environment" },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+          },
+          video,
+          onDecode,
+        );
+      } catch (primaryError) {
+        if (hasScannedRef.current) return;
+
+        const devices = await BrowserMultiFormatReader.listVideoInputDevices();
+
+        if (!devices.length) throw primaryError;
+
+        const preferred = devices.find((device) =>
+          /back|rear|environment/i.test(device.label),
+        );
+
+        const fallbackDevice = preferred ?? devices[devices.length - 1];
+
+        controlsRef.current = await reader.decodeFromConstraints(
+          {
+            audio: false,
+            video: {
+              deviceId: {
+                exact: fallbackDevice.deviceId,
+              },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+          },
+          video,
+          onDecode,
+        );
+      }
+    } catch (error) {
+      controlsRef.current?.stop();
+      controlsRef.current = null;
+      scannerStartingRef.current = false;
+      setScannerOpen(false);
+
+      setMessage(
+        error instanceof Error
+          ? `Camera error: ${error.message}`
+          : "Could not start the camera. Check camera permissions and try again.",
+      );
+    }
+  };
+
+  const addStop = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    const parsed = parseFedExPayload(barcode);
+    const destination = address.trim() || parsed?.address || "";
+    const normalizedBarcode = barcode.trim();
+
+    if (!destination) {
+      setMessage("Enter a delivery address before adding the stop.");
+      return;
+    }
+
+    if (
+      normalizedBarcode &&
+      stops.some((stop) => stop.barcode.trim() === normalizedBarcode)
+    ) {
+      setMessage("That barcode is already on your active stop list.");
+      return;
+    }
+
+    setBusy(true);
+    setMessage("Checking address…");
+
+    try {
+      let lat: number;
+      let lng: number;
+      let displayAddress: string;
+
+      const selected = selectedPlaceRef.current;
+
+      if (selected && selected.address === destination) {
+        lat = selected.lat;
+        lng = selected.lng;
+        displayAddress = selected.address;
+      } else {
+        const response = await fetch(
+          `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(destination)}`,
+          {
+            headers: { "Accept-Language": "en-CA,en" },
+          },
+        );
+
+        if (!response.ok) {
+          throw new Error("Address lookup failed. Please try again.");
+        }
+
+        const results = await response.json();
+
+        if (!results.length) {
+          throw new Error(
+            "Address not found. Select a suggestion or check the full address.",
+          );
+        }
+
+        lat = Number(results[0].lat);
+        lng = Number(results[0].lon);
+        displayAddress = results[0].display_name || destination;
+      }
+
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        throw new Error("The address did not return valid map coordinates.");
+      }
+
+      const stop: Stop = {
+        id: crypto.randomUUID(),
+        name: name.trim() || parsed?.name || "",
+        address: displayAddress,
+        barcode: normalizedBarcode,
+        description: description.trim(),
+        lat,
+        lng,
+        createdAt: Date.now(),
+      };
+
+      if (
+        stop.barcode &&
+        stops.some((existing) => existing.barcode === stop.barcode)
+      ) {
+        setMessage("That barcode is already on your active stop list.");
+        return;
+      }
+
+      setStops((current) => [stop, ...current]);
+      setAddress("");
+      setBarcode("");
+      setName("");
+      setDescription("");
+      selectedPlaceRef.current = null;
+      placesSessionRef.current = null;
+      setSuggestions([]);
+      setSuggestionsOpen(false);
+      setMessage("Stop added to your map.");
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Could not add this stop.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const completeStop = (id: string) => {
+    const stop = stops.find((item) => item.id === id);
+    if (!stop) return;
+
+    setStops((current) => current.filter((item) => item.id !== id));
+    setCompleted((current) => [stop, ...current]);
+    setMessage("Delivery marked complete.");
+  };
+
+  const undoStop = (id: string) => {
+    const stop = completed.find((item) => item.id === id);
+    if (!stop) return;
+
+    setCompleted((current) => current.filter((item) => item.id !== id));
+    setStops((current) => [stop, ...current]);
+    setMessage("Delivery moved back to active stops.");
+  };
+
+  const deleteStop = (id: string, isCompleted = false) => {
+    const list = isCompleted ? completed : stops;
+    const stop = list.find((item) => item.id === id);
+
+    if (!stop) return;
+
+    if (!confirm(`Delete "${stop.name || stop.address}" from your tracker?`)) {
+      return;
+    }
+
+    if (isCompleted) {
+      setCompleted((current) => current.filter((item) => item.id !== id));
+    } else {
+      setStops((current) => current.filter((item) => item.id !== id));
+    }
+
+    setMessage("Stop deleted.");
+  };
+
+  const optimizeRoute = async () => {
+    if (!stops.length) {
+      setMessage("Add at least one stop before optimizing your route.");
+      return;
+    }
+
+    if (!navigator.geolocation) {
+      setMessage("Your browser does not support location services.");
+      return;
+    }
+
+    setOptimizing(true);
+    setMessage("Getting your current location…");
+
+    try {
+      const position = await new Promise<GeolocationPosition>(
+        (resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, {
+            enableHighAccuracy: true,
+            timeout: 15000,
+            maximumAge: 30000,
+          });
+        },
+      );
+
+      const origin = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+      };
+
+      const coordinates = [
+        `${origin.lng},${origin.lat}`,
+        ...stops.map((stop) => `${stop.lng},${stop.lat}`),
+      ].join(";");
+
+      setMessage("Optimizing stop order…");
+
+      const response = await fetch(
+        `https://router.project-osrm.org/trip/v1/driving/${coordinates}?source=first&roundtrip=false&overview=false`,
+      );
+
+      if (!response.ok) {
+        throw new Error("The route service is temporarily unavailable.");
+      }
+
+      const result = await response.json();
+
+      if (result.code !== "Ok" || !Array.isArray(result.waypoints)) {
+        throw new Error(
+          "Could not find a drivable route for these addresses. Check the map pins and try again.",
+        );
+      }
+
+      const optimized = stops
+        .map((stop, index) => ({
+          stop,
+          waypoint: result.waypoints[index + 1],
+        }))
+        .sort(
+          (a, b) =>
+            (a.waypoint?.waypoint_index ?? Number.MAX_SAFE_INTEGER) -
+            (b.waypoint?.waypoint_index ?? Number.MAX_SAFE_INTEGER),
+        )
+        .map((entry) => entry.stop);
+
+      setStops(optimized);
+      setMessage(
+        "Route optimized from your current location. Follow the reordered stop list.",
+      );
+    } catch (error) {
+      let detail =
+        error instanceof Error ? error.message : "Could not optimize route.";
+
+      if (typeof error === "object" && error !== null && "code" in error) {
+        const geoError = error as GeolocationPositionError;
+
+        if (geoError.code === geoError.PERMISSION_DENIED) {
+          detail =
+            "Location permission was denied. Allow location access and try again.";
+        } else if (
+          geoError.code === geoError.POSITION_UNAVAILABLE ||
+          geoError.code === geoError.TIMEOUT
+        ) {
+          detail =
+            "Could not get your location. Check GPS/location settings and try again.";
+        }
+      }
+
+      setMessage(detail);
+    } finally {
+      setOptimizing(false);
+    }
+  };
+
+  const clearDay = () => {
+    if (
+      !confirm(
+        "Clear all active and completed stops from this device? This cannot be undone.",
+      )
+    ) {
+      return;
+    }
+
+    setStops([]);
+    setCompleted([]);
+    setMessage("Route cleared.");
+  };
+
+  const progress = useMemo(
+    () =>
+      stops.length + completed.length
+        ? Math.round(
+            (completed.length / (stops.length + completed.length)) * 100,
+          )
+        : 0,
+    [stops.length, completed.length],
+  );
+
+  const updateAddress = (value: string) => {
+    setAddress(value);
+    selectedPlaceRef.current = null;
+    setSuggestionsOpen(true);
+  };
+
+  return (
+    <main className="app-shell">
+      <style jsx>{`
+        .camera-box {
+          margin-top: 14px;
+          overflow: hidden;
+          border: 1px solid #dce4eb;
+          border-radius: 14px;
+          background: #101820;
+        }
+
+        .camera-preview {
+          position: relative;
+          width: 100%;
+          aspect-ratio: 4 / 3;
+          overflow: hidden;
+          background: #101820;
+        }
+
+        .camera-preview video {
+          display: block;
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
+
+        .scan-overlay {
+          position: absolute;
+          inset: 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          pointer-events: none;
+          background: rgba(0, 0, 0, 0.15);
+        }
+
+        .scan-frame {
+          position: relative;
+          width: 90%;
+          height: 44%;
+          border: 1px dashed rgba(255, 255, 255, 0.8);
+          border-radius: 8px;
+        }
+
+        .corner {
+          position: absolute;
+          width: 24px;
+          height: 24px;
+          border-color: #32d583;
+          border-style: solid;
+        }
+
+        .top-left {
+          top: -2px;
+          left: -2px;
+          border-width: 4px 0 0 4px;
+          border-radius: 7px 0 0 0;
+        }
+
+        .top-right {
+          top: -2px;
+          right: -2px;
+          border-width: 4px 4px 0 0;
+          border-radius: 0 7px 0 0;
+        }
+
+        .bottom-left {
+          bottom: -2px;
+          left: -2px;
+          border-width: 0 0 4px 4px;
+          border-radius: 0 0 0 7px;
+        }
+
+        .bottom-right {
+          right: -2px;
+          bottom: -2px;
+          border-width: 0 4px 4px 0;
+          border-radius: 0 0 7px 0;
+        }
+
+        .scan-line {
+          position: absolute;
+          top: 50%;
+          left: 4%;
+          width: 92%;
+          height: 2px;
+          background: #32d583;
+          box-shadow: 0 0 8px rgba(50, 213, 131, 0.8);
+        }
+
+        .scan-instructions {
+          margin: 0;
+          padding: 12px;
+          color: #fff;
+          font-size: 13px;
+          line-height: 1.5;
+          text-align: center;
+        }
+
+        .address-field {
+          position: relative;
+        }
+
+        .address-suggestions {
+          position: absolute;
+          z-index: 1000;
+          top: calc(100% - 2px);
+          right: 0;
+          left: 0;
+          overflow: hidden;
+          border: 1px solid #dce4eb;
+          border-radius: 0 0 12px 12px;
+          background: #fff;
+          box-shadow: 0 10px 25px rgba(16, 24, 40, 0.12);
+        }
+
+        .suggestion-button {
+          display: block;
+          width: 100%;
+          padding: 12px 14px;
+          border: 0;
+          border-bottom: 1px solid #edf0f3;
+          background: #fff;
+          color: #202c39;
+          font: inherit;
+          text-align: left;
+          cursor: pointer;
+        }
+
+        .suggestion-button:hover,
+        .suggestion-button:focus {
+          background: #f0f7ff;
+          outline: none;
+        }
+
+        .suggestion-button:last-child {
+          border-bottom: 0;
+        }
+
+        .suggestion-main {
+          display: block;
+          font-size: 13px;
+          font-weight: 600;
+          line-height: 1.45;
+        }
+
+        .suggestion-caption {
+          display: block;
+          margin-top: 6px;
+          padding: 7px 10px;
+          background: #f8fafc;
+          color: #64748b;
+          font-size: 10px;
+          text-align: right;
+        }
+
+        .optimize-button {
+          display: flex;
+          width: 100%;
+          align-items: center;
+          justify-content: center;
+          gap: 9px;
+          margin: 0 0 14px;
+          padding: 12px 14px;
+          border: 1px solid #b9d7fa;
+          border-radius: 12px;
+          background: #eff6ff;
+          color: #174b87;
+          font: inherit;
+          font-size: 13px;
+          font-weight: 700;
+          cursor: pointer;
+        }
+
+        .optimize-button:disabled {
+          opacity: 0.55;
+          cursor: wait;
+        }
+
+        .stop-description {
+          display: block;
+          margin-top: 7px;
+          color: #a65d00;
+          font-size: 13px;
+          font-weight: 700;
+          line-height: 1.45;
+          overflow-wrap: anywhere;
+        }
+
+        .stop-actions {
+          display: flex;
+          align-items: center;
+          gap: 7px;
+          flex-shrink: 0;
+        }
+
+        .delete-button {
+          display: inline-flex;
+          width: 34px;
+          height: 34px;
+          align-items: center;
+          justify-content: center;
+          border: 1px solid #f1c9c9;
+          border-radius: 9px;
+          background: #fff;
+          color: #b42318;
+          font-size: 18px;
+          cursor: pointer;
+        }
+
+        .delete-button:hover {
+          background: #fff1f0;
+        }
+
+        .completed-item .stop-actions {
+          margin-left: auto;
+        }
+
+        @media (max-width: 600px) {
+          .stop-item {
+            flex-wrap: wrap;
+          }
+
+          .stop-details {
+            min-width: 0;
+            flex: 1;
+          }
+
+          .stop-actions {
+            width: 100%;
+            justify-content: flex-end;
+          }
+
+          .scan-frame {
+            width: 92%;
+            height: 40%;
+          }
+
+          .corner {
+            width: 20px;
+            height: 20px;
+          }
+        }
+      `}</style>
+
+      <header className="topbar">
+        <a className="brand" href="#">
+          <span className="brand-mark">R</span>
+          <span>
+            route<span className="brand-accent">pin</span>
+            <small>DELIVERY STOP TRACKER</small>
+          </span>
+        </a>
+
+        <div className="topbar-right">
+          <span className="privacy-dot" /> Saved on this device{" "}
+          <button
+            className="icon-button"
+            title="Clear route"
+            onClick={clearDay}
+          >
+            ↺
+          </button>
+        </div>
+      </header>
+
+      <section className="welcome">
+        <div>
+          <div className="eyebrow">YOUR ROUTE, AT A GLANCE</div>
+          <h1>
+            Make every stop <span>count.</span>
+          </h1>
+          <p>Scan a package, pin the address, and keep your day moving.</p>
+        </div>
+        <div className="date-chip">● &nbsp; LIVE ROUTE</div>
+      </section>
+
+      <section className="stats-grid">
+        <div className="stat-card active-stat">
+          <div className="stat-label">
+            REMAINING STOPS <span>↗</span>
+          </div>
+          <div className="stat-number">
+            {stops.length.toString().padStart(2, "0")}
+          </div>
+          <div className="stat-foot">Deliveries left to complete</div>
+        </div>
+
+        <div className="stat-card">
+          <div className="stat-label">COMPLETED</div>
+          <div className="stat-number">
+            {completed.length.toString().padStart(2, "0")}
+          </div>
+          <div className="stat-foot">Stops finished today</div>
+        </div>
+
+        <div className="stat-card progress-card">
+          <div className="stat-label">ROUTE PROGRESS</div>
+          <div className="progress-row">
+            <div className="stat-number">
+              {progress}
+              <small>%</small>
+            </div>
+            <div
+              className="progress-ring"
+              style={{
+                background: `conic-gradient(#f5a623 ${progress * 3.6}deg, #e8edf1 0deg)`,
+              }}
+            >
+              <div />
+            </div>
+          </div>
+          <div className="progress-track">
+            <span style={{ width: `${progress}%` }} />
+          </div>
+          <div className="stat-foot">Keep up the good work</div>
+        </div>
+      </section>
+
+      <section className="workspace">
+        <div className="map-panel">
+          <div className="panel-heading">
+            <div>
+              <h2>Stop map</h2>
+              <p>
+                {stops.length
+                  ? `${stops.length} active ${stops.length === 1 ? "stop" : "stops"} on your route`
+                  : "Your scanned stops will appear here"}
+              </p>
+            </div>
+            <span className="map-legend">
+              <i /> Active stop
+            </span>
+          </div>
+
+          <div className="map-wrap">
+            <MapView stops={stops} onComplete={completeStop} />
+
+            {!stops.length && (
+              <div className="map-empty">
+                <div className="empty-icon">⌖</div>
+                <strong>Your route starts here</strong>
+                <span>Add your first package to see it on the map.</span>
+              </div>
+            )}
+          </div>
+
+          <div className="map-footer">
+            <span>Map data © OpenStreetMap contributors</span>
+            <span>Tap a pin for directions</span>
+          </div>
+        </div>
+
+        <aside className="side-panel">
+          <div className="panel-heading side-heading">
+            <div>
+              <h2>Add a stop</h2>
+              <p>Scan the barcode or enter details</p>
+            </div>
+            <span className="step-badge">01</span>
+          </div>
+
+          <button
+            type="button"
+            className={`scan-button ${scannerOpen ? "scanning" : ""}`}
+            onClick={scannerOpen ? stopScanner : scanBarcode}
+          >
+            <span className="scan-icon">▦</span>
+            <span>
+              <strong>
+                {scannerOpen ? "Stop scanning" : "Scan package barcode"}
+              </strong>
+              <small>
+                {scannerOpen ? "Camera is active" : "Use your phone camera"}
+              </small>
+            </span>
+            <span className="button-arrow">{scannerOpen ? "×" : "↗"}</span>
+          </button>
+
+          {scannerOpen && (
+            <div className="camera-box">
+              <div className="camera-preview">
+                <video ref={videoRef} autoPlay muted playsInline />
+
+                <div className="scan-overlay" aria-hidden="true">
+                  <div className="scan-frame">
+                    <span className="corner top-left" />
+                    <span className="corner top-right" />
+                    <span className="corner bottom-left" />
+                    <span className="corner bottom-right" />
+                    <span className="scan-line" />
+                  </div>
+                </div>
+              </div>
+
+              <p className="scan-instructions">
+                Align the entire PDF417 barcode inside the frame. Keep your
+                phone steady, avoid glare, and make sure the bars are sharp.
+              </p>
+            </div>
+          )}
+
+          <div className="or-divider">
+            <span />
+            OR ENTER MANUALLY
+            <span />
+          </div>
+
+          <form className="stop-form" onSubmit={addStop}>
+            <label>
+              BARCODE / TRACKING NUMBER <span>OPTIONAL</span>
+              <input
+                value={barcode}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setBarcode(value);
+
+                  const parsed = parseFedExPayload(value);
+
+                  if (parsed) {
+                    if (parsed.address) {
+                      setAddress(parsed.address);
+                      selectedPlaceRef.current = null;
+                    }
+
+                    if (parsed.name) setName(parsed.name);
+
+                    setMessage(
+                      parsed.address
+                        ? "FedEx address details detected. Confirm the address before adding the stop."
+                        : "FedEx package details detected. Enter the delivery address manually.",
+                    );
+                  }
+                }}
+                placeholder="Scan or paste barcode data"
+              />
+            </label>
+
+            <label>
+              RECIPIENT / STOP NAME <span>OPTIONAL</span>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. Smith residence"
+              />
+            </label>
+
+            <label>
+              PACKAGE DESCRIPTION <span>OPTIONAL</span>
+              <input
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="e.g. Large box — behind passenger seat"
+              />
+            </label>
+
+            <label className="address-field">
+              DELIVERY ADDRESS <b>*</b>
+              <textarea
+                required
+                value={address}
+                onChange={(e) => updateAddress(e.target.value)}
+                onFocus={() => setSuggestionsOpen(true)}
+                onBlur={() => {
+                  window.setTimeout(() => setSuggestionsOpen(false), 180);
+                }}
+                placeholder="Start typing a street address…"
+                rows={3}
+                autoComplete="off"
+              />
+              {suggestionsOpen && suggestions.length > 0 && (
+                <div
+                  className="address-suggestions"
+                  role="listbox"
+                  aria-label="Address suggestions"
+                >
+                  {suggestions.map((suggestion) => (
+                    <button
+                      key={suggestion.id}
+                      type="button"
+                      className="suggestion-button"
+                      role="option"
+                      aria-selected={false}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => void selectSuggestion(suggestion)}
+                    >
+                      <span className="suggestion-main">
+                        {suggestion.label}
+                      </span>
+                    </button>
+                  ))}
+
+                  <div className="suggestion-caption">
+                    Google Maps address suggestions
+                  </div>
+                </div>
+              )}
+            </label>
+
+            <button className="add-button" disabled={busy}>
+              {busy ? (
+                <>
+                  <span className="spinner" /> Working…
+                </>
+              ) : (
+                <>
+                  <span>＋</span> Add stop to map{" "}
+                  <span className="button-arrow">↗</span>
+                </>
+              )}
+            </button>
+          </form>
+
+          {message && (
+            <div
+              className={`message ${
+                /failed|could not|not found|already|no camera|camera error|denied|error/i.test(
+                  message,
+                )
+                  ? "message-error"
+                  : ""
+              }`}
+              role="status"
+            >
+              {message}
+            </div>
+          )}
+
+          <div className="privacy-note">
+            <span>ⓘ</span>
+            <p>
+              PDF417 barcodes are decoded in your browser. Confirm the address
+              and package description before adding a stop.
+            </p>
+          </div>
+        </aside>
+      </section>
+
+      <section className="stops-section">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">YOUR DELIVERY LIST</div>
+            <h2>
+              Stops to make <span className="count-pill">{stops.length}</span>
+            </h2>
+          </div>
+
+          <button
+            className="text-button"
+            onClick={() => setShowCompleted((value) => !value)}
+          >
+            {showCompleted
+              ? "Hide completed"
+              : `View completed (${completed.length})`}{" "}
+            <span>→</span>
+          </button>
+        </div>
+
+        <button
+          type="button"
+          className="optimize-button"
+          disabled={optimizing || stops.length === 0}
+          onClick={() => void optimizeRoute()}
+        >
+          <span>{optimizing ? "◌" : "⌖"}</span>
+          {optimizing
+            ? "Optimizing route…"
+            : `Optimize route from my location (${stops.length} stops)`}
+        </button>
+
+        {stops.length ? (
+          <div className="stop-list">
+            {stops.map((stop, index) => (
+              <article className="stop-item" key={stop.id}>
+                <div className="stop-index">
+                  {String(stops.length - index).padStart(2, "0")}
+                </div>
+
+                <div className="stop-details">
+                  <strong>
+                    {stop.name || `Delivery stop ${stops.length - index}`}
+                  </strong>
+                  <span>{stop.address}</span>
+
+                  {stop.description && (
+                    <span className="stop-description">
+                      Package: {stop.description}
+                    </span>
+                  )}
+                </div>
+
+                <div className="stop-actions">
+                  <a
+                    className="navigate-button"
+                    href={googleMapsUrl(stop.address)}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Navigate <span>↗</span>
+                  </a>
+
+                  <button
+                    className="complete-button"
+                    onClick={() => completeStop(stop.id)}
+                    title="Mark this delivery complete"
+                    aria-label={`Complete ${stop.name || stop.address}`}
+                  >
+                    ✓
+                  </button>
+
+                  <button
+                    className="delete-button"
+                    onClick={() => deleteStop(stop.id)}
+                    title="Delete this stop"
+                    aria-label={`Delete ${stop.name || stop.address}`}
+                  >
+                    ×
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="list-empty">
+            <span>✓</span>
+            <div>
+              <strong>All caught up</strong>
+              <p>
+                No active stops. Scan a package or add an address to get
+                started.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {showCompleted && (
+          <div className="completed-list">
+            <div className="completed-title">COMPLETED DELIVERIES</div>
+
+            {completed.length ? (
+              completed.map((stop) => (
+                <article className="stop-item completed-item" key={stop.id}>
+                  <div className="stop-index done">✓</div>
+
+                  <div className="stop-details">
+                    <strong>{stop.name || "Delivery stop"}</strong>
+                    <span>{stop.address}</span>
+
+                    {stop.description && (
+                      <span className="stop-description">
+                        Package: {stop.description}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="stop-actions">
+                    <button
+                      className="undo-button"
+                      onClick={() => undoStop(stop.id)}
+                    >
+                      Undo
+                    </button>
+
+                    <button
+                      className="delete-button"
+                      onClick={() => deleteStop(stop.id, true)}
+                      title="Delete completed stop"
+                      aria-label={`Delete ${stop.name || stop.address}`}
+                    >
+                      ×
+                    </button>
+                  </div>
+                </article>
+              ))
+            ) : (
+              <p className="no-completed">No completed deliveries yet.</p>
+            )}
+          </div>
+        )}
+      </section>
+
+      <footer className="footer">
+        <span>
+          ROUTEPIN <b>•</b> BUILT FOR THE ROAD
+        </span>
+        <span>
+          Stops are stored locally on this device. Don&apos;t enter unnecessary
+          customer information.
+        </span>
+      </footer>
+    </main>
+  );
 }
