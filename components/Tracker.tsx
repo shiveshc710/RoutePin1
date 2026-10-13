@@ -1,38 +1,56 @@
 "use client";
 
 import dynamic from "next/dynamic";
+
 import { BarcodeFormat, DecodeHintType } from "@zxing/library";
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
 import type { BrowserMultiFormatReader } from "@zxing/browser";
+
 import { googleMapsUrl } from "../lib/maps";
 
 export type Stop = {
   id: string;
+
   name: string;
+
   address: string;
+
   barcode: string;
+
   lat: number;
+
   lng: number;
+
   createdAt: number;
+
   description: string;
 };
 
 type FedExDetails = {
   address: string;
+
   name: string;
+
   postalCode: string;
+
   weight: string;
+
   references: string[];
 };
 
 type AddressSuggestion = {
   id: string;
+
   label: string;
+
   prediction: any;
 };
 
 const MapView = dynamic(() => import("./MapView"), {
   ssr: false,
+
   loading: () => <div className="map-loading">Preparing your map…</div>,
 });
 
@@ -41,15 +59,21 @@ const STORAGE_KEY = "routepin-stops-v1";
 declare global {
   interface Window {
     google?: any;
+
     __routepinGooglePromise?: Promise<any>;
   }
 }
 
 /**
+
  * Loads Google Places once and reuses the in-flight request.
+
  * Polls for importLibrary rather than assuming script.onload
+
  * means the Google Maps API is ready.
+
  */
+
 function loadGooglePlaces(): Promise<any> {
   if (typeof window === "undefined") {
     return Promise.reject(new Error("Google Places requires a browser."));
@@ -73,7 +97,9 @@ function loadGooglePlaces(): Promise<any> {
 
   window.__routepinGooglePromise = new Promise((resolve, reject) => {
     let settled = false;
+
     let timeoutId: number | undefined;
+
     let pollId: number | undefined;
 
     const cleanup = () => {
@@ -90,8 +116,11 @@ function loadGooglePlaces(): Promise<any> {
       if (settled) return;
 
       settled = true;
+
       cleanup();
+
       window.__routepinGooglePromise = undefined;
+
       reject(error);
     };
 
@@ -108,7 +137,9 @@ function loadGooglePlaces(): Promise<any> {
         if (settled) return;
 
         settled = true;
+
         cleanup();
+
         resolve(places);
       } catch (error) {
         fail(
@@ -127,11 +158,14 @@ function loadGooglePlaces(): Promise<any> {
 
     if (!existingScript) {
       script.dataset.routepinGoogle = "true";
+
       script.src =
-        "https://maps.googleapis.com/maps/api/js" +
+        "https\://maps.googleapis.com/maps/api/js" +
         `?key=${encodeURIComponent(key)}` +
         "&v=weekly&loading=async";
+
       script.async = true;
+
       script.defer = true;
     }
 
@@ -151,6 +185,7 @@ function loadGooglePlaces(): Promise<any> {
 
     script.addEventListener(
       "error",
+
       () => {
         fail(
           new Error(
@@ -158,6 +193,7 @@ function loadGooglePlaces(): Promise<any> {
           ),
         );
       },
+
       { once: true },
     );
 
@@ -175,8 +211,11 @@ function parseFedExPayload(raw: string): FedExDetails | null {
   if (!raw.includes("[)>")) return null;
 
   const fields = raw
+
     .split(/[\x1d\x1e\x1c]/)
+
     .map((value) => value.trim())
+
     .filter(Boolean);
 
   const postalField = fields.find((value) =>
@@ -185,29 +224,41 @@ function parseFedExPayload(raw: string): FedExDetails | null {
 
   const postalCode = postalField
     ? postalField
+
         .slice(2)
+
         .replace(/\s+/g, "")
+
         .toUpperCase()
+
         .replace(/^(.{3})(.{3})$/, "$1 $2")
     : "";
 
   const markerIndex = fields.findIndex((value) => value === "N");
 
   let address = "";
+
   let name = "";
 
   if (markerIndex >= 0) {
     const afterMarker = fields.slice(markerIndex + 1);
+
     const street = afterMarker[0] ?? "";
+
     const city = afterMarker[1] ?? "";
+
     const province = afterMarker[2] ?? "";
+
     const recipient = afterMarker[3] ?? "";
 
     if (street && city && /^[A-Z]{2}$/i.test(province) && recipient) {
       address = [
         street,
+
         city,
+
         `${province.toUpperCase()}${postalCode ? ` ${postalCode}` : ""}`,
+
         "Canada",
       ].join(", ");
 
@@ -232,45 +283,70 @@ function parseFedExPayload(raw: string): FedExDetails | null {
 function normalizeStop(stop: any): Stop {
   return {
     ...stop,
+
     description: typeof stop.description === "string" ? stop.description : "",
+
     name: typeof stop.name === "string" ? stop.name : "",
+
     address: typeof stop.address === "string" ? stop.address : "",
+
     barcode: typeof stop.barcode === "string" ? stop.barcode : "",
   };
 }
 
 export default function Tracker() {
   const [stops, setStops] = useState<Stop[]>([]);
+
   const [completed, setCompleted] = useState<Stop[]>([]);
+
   const [barcode, setBarcode] = useState("");
+
   const [address, setAddress] = useState("");
+
   const [name, setName] = useState("");
+
   const [description, setDescription] = useState("");
+
   const [busy, setBusy] = useState(false);
+
   const [message, setMessage] = useState("");
+
   const [scannerOpen, setScannerOpen] = useState(false);
+
   const [showCompleted, setShowCompleted] = useState(false);
+
   const [suggestions, setSuggestions] = useState<AddressSuggestion[]>([]);
+
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+
   const [placesReady, setPlacesReady] = useState(false);
+
   const [optimizing, setOptimizing] = useState(false);
 
   const selectedPlaceRef = useRef<{
     address: string;
+
     lat: number;
+
     lng: number;
   } | null>(null);
 
   const placesSessionRef = useRef<any>(null);
+
   const suggestionRequestRef = useRef(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
+
   const controlsRef = useRef<{ stop: () => void } | null>(null);
+
   const hasScannedRef = useRef(false);
+
   const scannerStartingRef = useRef(false);
 
   // Restore saved stops from local storage.
+
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
@@ -294,6 +370,7 @@ export default function Tracker() {
   }, []);
 
   // Persist stop changes.
+
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ stops, completed }));
@@ -303,6 +380,7 @@ export default function Tracker() {
   }, [stops, completed]);
 
   // Initialize Google Places.
+
   useEffect(() => {
     let cancelled = false;
 
@@ -310,6 +388,7 @@ export default function Tracker() {
       .then(() => {
         if (!cancelled) setPlacesReady(true);
       })
+
       .catch((error) => {
         console.error("Google Places initialization failed:", error);
 
@@ -328,8 +407,10 @@ export default function Tracker() {
   }, []);
 
   // Fetch autocomplete suggestions while typing.
+
   useEffect(() => {
     const query = address.trim();
+
     const requestId = ++suggestionRequestRef.current;
 
     if (
@@ -339,6 +420,7 @@ export default function Tracker() {
       selectedPlaceRef.current?.address === query
     ) {
       setSuggestions([]);
+
       return;
     }
 
@@ -357,7 +439,9 @@ export default function Tracker() {
         const response =
           await places.AutocompleteSuggestion.fetchAutocompleteSuggestions({
             input: query,
+
             includedRegionCodes: ["ca"],
+
             sessionToken: placesSessionRef.current,
           });
 
@@ -367,14 +451,20 @@ export default function Tracker() {
 
         setSuggestions(
           (response.suggestions ?? [])
+
             .filter((item: any) => item.placePrediction)
+
             .slice(0, 5)
+
             .map((item: any) => ({
               id: [
                 item.placePrediction.placeId,
+
                 item.placePrediction.text?.toString(),
               ].join("-"),
+
               label: item.placePrediction.text?.toString() ?? "",
+
               prediction: item.placePrediction,
             })),
         );
@@ -383,6 +473,7 @@ export default function Tracker() {
 
         if (requestId === suggestionRequestRef.current) {
           setSuggestions([]);
+
           setMessage(
             error instanceof Error
               ? `Address suggestions failed: ${error.message}`
@@ -398,8 +489,11 @@ export default function Tracker() {
   const selectSuggestion = async (suggestion: AddressSuggestion) => {
     try {
       setBusy(true);
+
       setMessage("Loading selected address…");
+
       setSuggestionsOpen(false);
+
       setSuggestions([]);
 
       const place = suggestion.prediction.toPlace();
@@ -409,6 +503,7 @@ export default function Tracker() {
       });
 
       const location = place.location;
+
       const formattedAddress = place.formattedAddress || suggestion.label;
 
       if (
@@ -423,12 +518,16 @@ export default function Tracker() {
 
       selectedPlaceRef.current = {
         address: formattedAddress,
+
         lat: location.lat(),
+
         lng: location.lng(),
       };
 
       setAddress(formattedAddress);
+
       placesSessionRef.current = null;
+
       setMessage("Address selected. Confirm the details and add the stop.");
     } catch (error) {
       console.error("Could not select Google address:", error);
@@ -445,34 +544,46 @@ export default function Tracker() {
 
   const stopScanner = useCallback(() => {
     hasScannedRef.current = true;
+
     controlsRef.current?.stop();
+
     controlsRef.current = null;
+
     scannerStartingRef.current = false;
+
     setScannerOpen(false);
   }, []);
 
   useEffect(() => {
     return () => {
       hasScannedRef.current = true;
+
       controlsRef.current?.stop();
+
       controlsRef.current = null;
+
       scannerStartingRef.current = false;
     };
   }, []);
 
   // PDF417 package scanner.
+
   const scanBarcode = async () => {
     if (scannerStartingRef.current || scannerOpen) return;
 
     scannerStartingRef.current = true;
+
     hasScannedRef.current = false;
+
     setMessage("");
+
     setScannerOpen(true);
 
     try {
       const { BrowserMultiFormatReader } = await import("@zxing/browser");
 
       const hints = new Map<DecodeHintType, unknown>();
+
       hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]);
 
       const reader = new BrowserMultiFormatReader(hints, {
@@ -485,6 +596,7 @@ export default function Tracker() {
 
       for (let attempt = 0; !video && attempt < 20; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, 50));
+
         video = videoRef.current;
       }
 
@@ -500,7 +612,9 @@ export default function Tracker() {
         hasScannedRef.current = true;
 
         const raw = result.getText();
+
         const format = String(result.getBarcodeFormat());
+
         const parsed = parseFedExPayload(raw);
 
         setBarcode(raw);
@@ -508,6 +622,7 @@ export default function Tracker() {
         if (parsed) {
           if (parsed.address) {
             setAddress(parsed.address);
+
             selectedPlaceRef.current = null;
           }
 
@@ -515,11 +630,15 @@ export default function Tracker() {
 
           const extraDetails = [
             parsed.postalCode && `Postal code: ${parsed.postalCode}`,
+
             parsed.weight && `Weight: ${parsed.weight}`,
+
             parsed.references.length > 0 &&
               `References: ${parsed.references.join(", ")}`,
           ]
+
             .filter(Boolean)
+
             .join(" · ");
 
           setMessage(
@@ -536,8 +655,11 @@ export default function Tracker() {
         }
 
         controlsRef.current?.stop();
+
         controlsRef.current = null;
+
         scannerStartingRef.current = false;
+
         setScannerOpen(false);
       };
 
@@ -545,13 +667,18 @@ export default function Tracker() {
         controlsRef.current = await reader.decodeFromConstraints(
           {
             audio: false,
+
             video: {
               facingMode: { ideal: "environment" },
+
               width: { ideal: 1280 },
+
               height: { ideal: 720 },
             },
           },
+
           video,
+
           onDecode,
         );
       } catch (primaryError) {
@@ -570,22 +697,30 @@ export default function Tracker() {
         controlsRef.current = await reader.decodeFromConstraints(
           {
             audio: false,
+
             video: {
               deviceId: {
                 exact: fallbackDevice.deviceId,
               },
+
               width: { ideal: 1280 },
+
               height: { ideal: 720 },
             },
           },
+
           video,
+
           onDecode,
         );
       }
     } catch (error) {
       controlsRef.current?.stop();
+
       controlsRef.current = null;
+
       scannerStartingRef.current = false;
+
       setScannerOpen(false);
 
       setMessage(
@@ -600,11 +735,14 @@ export default function Tracker() {
     e.preventDefault();
 
     const parsed = parseFedExPayload(barcode);
+
     const destination = address.trim() || parsed?.address || "";
+
     const normalizedBarcode = barcode.trim();
 
     if (!destination) {
       setMessage("Enter a delivery address before adding the stop.");
+
       return;
     }
 
@@ -613,26 +751,33 @@ export default function Tracker() {
       stops.some((stop) => stop.barcode.trim() === normalizedBarcode)
     ) {
       setMessage("That barcode is already on your active stop list.");
+
       return;
     }
 
     setBusy(true);
+
     setMessage("Checking address…");
 
     try {
       let lat: number;
+
       let lng: number;
+
       let displayAddress: string;
 
       const selected = selectedPlaceRef.current;
 
       if (selected && selected.address === destination) {
         lat = selected.lat;
+
         lng = selected.lng;
+
         displayAddress = selected.address;
       } else {
         const response = await fetch(
-          `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(destination)}`,
+          `https\://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(destination)}`,
+
           {
             headers: { "Accept-Language": "en-CA,en" },
           },
@@ -651,7 +796,9 @@ export default function Tracker() {
         }
 
         lat = Number(results[0].lat);
+
         lng = Number(results[0].lon);
+
         displayAddress = results[0].display_name || destination;
       }
 
@@ -661,12 +808,19 @@ export default function Tracker() {
 
       const stop: Stop = {
         id: crypto.randomUUID(),
+
         name: name.trim() || parsed?.name || "",
+
         address: displayAddress,
+
         barcode: normalizedBarcode,
+
         description: description.trim(),
+
         lat,
+
         lng,
+
         createdAt: Date.now(),
       };
 
@@ -675,18 +829,28 @@ export default function Tracker() {
         stops.some((existing) => existing.barcode === stop.barcode)
       ) {
         setMessage("That barcode is already on your active stop list.");
+
         return;
       }
 
-      setStops((current) => [stop, ...current]);
+      setStops((current) => [...current, stop]);
+
       setAddress("");
+
       setBarcode("");
+
       setName("");
+
       setDescription("");
+
       selectedPlaceRef.current = null;
+
       placesSessionRef.current = null;
+
       setSuggestions([]);
+
       setSuggestionsOpen(false);
+
       setMessage("Stop added to your map.");
     } catch (error) {
       setMessage(
@@ -699,24 +863,31 @@ export default function Tracker() {
 
   const completeStop = (id: string) => {
     const stop = stops.find((item) => item.id === id);
+
     if (!stop) return;
 
     setStops((current) => current.filter((item) => item.id !== id));
+
     setCompleted((current) => [stop, ...current]);
+
     setMessage("Delivery marked complete.");
   };
 
   const undoStop = (id: string) => {
     const stop = completed.find((item) => item.id === id);
+
     if (!stop) return;
 
     setCompleted((current) => current.filter((item) => item.id !== id));
-    setStops((current) => [stop, ...current]);
+
+    setStops((current) => [...current, stop]);
+
     setMessage("Delivery moved back to active stops.");
   };
 
   const deleteStop = (id: string, isCompleted = false) => {
     const list = isCompleted ? completed : stops;
+
     const stop = list.find((item) => item.id === id);
 
     if (!stop) return;
@@ -740,39 +911,21 @@ export default function Tracker() {
       return;
     }
 
-    if (!navigator.geolocation) {
-      setMessage("Your browser does not support location services.");
-      return;
-    }
-
     setOptimizing(true);
-    setMessage("Getting your current location…");
+    setMessage("Optimizing route from 985 Moodie Drive…");
 
     try {
-      const position = await new Promise<GeolocationPosition>(
-        (resolve, reject) => {
-          navigator.geolocation.getCurrentPosition(resolve, reject, {
-            enableHighAccuracy: true,
-            timeout: 15000,
-            maximumAge: 30000,
-          });
-        },
-      );
-
-      const origin = {
-        lat: position.coords.latitude,
-        lng: position.coords.longitude,
-      };
-
+      // Fixed station location: 985 Moodie Drive, Nepean, ON.
+      const station = { lat: 45.2791694, lng: -75.8085255 };
+      // Include the station at both ends to create a round trip.
       const coordinates = [
-        `${origin.lng},${origin.lat}`,
+        `${station.lng},${station.lat}`,
         ...stops.map((stop) => `${stop.lng},${stop.lat}`),
+        `${station.lng},${station.lat}`,
       ].join(";");
 
-      setMessage("Optimizing stop order…");
-
       const response = await fetch(
-        `https://router.project-osrm.org/trip/v1/driving/${coordinates}?source=first&roundtrip=false&overview=false`,
+        `https://router.project-osrm.org/trip/v1/driving/${coordinates}?source=first&destination=last&roundtrip=false&overview=false`,
       );
 
       if (!response.ok) {
@@ -783,10 +936,12 @@ export default function Tracker() {
 
       if (result.code !== "Ok" || !Array.isArray(result.waypoints)) {
         throw new Error(
-          "Could not find a drivable route for these addresses. Check the map pins and try again.",
+          "Could not find a drivable round-trip route. Check the map pins and try again.",
         );
       }
 
+      // Input waypoint 0 and the final waypoint are the station;
+      // delivery waypoints are input indices 1 through stops.length.
       const optimized = stops
         .map((stop, index) => ({
           stop,
@@ -799,30 +954,23 @@ export default function Tracker() {
         )
         .map((entry) => entry.stop);
 
-      setStops(optimized);
-      setMessage(
-        "Route optimized from your current location. Follow the reordered stop list.",
-      );
-    } catch (error) {
-      let detail =
-        error instanceof Error ? error.message : "Could not optimize route.";
-
-      if (typeof error === "object" && error !== null && "code" in error) {
-        const geoError = error as GeolocationPositionError;
-
-        if (geoError.code === geoError.PERMISSION_DENIED) {
-          detail =
-            "Location permission was denied. Allow location access and try again.";
-        } else if (
-          geoError.code === geoError.POSITION_UNAVAILABLE ||
-          geoError.code === geoError.TIMEOUT
-        ) {
-          detail =
-            "Could not get your location. Check GPS/location settings and try again.";
-        }
+      if (
+        optimized.length !== stops.length ||
+        optimized.some((stop) => !stop)
+      ) {
+        throw new Error(
+          "The route service did not return every delivery stop.",
+        );
       }
 
-      setMessage(detail);
+      setStops(optimized);
+      setMessage(
+        "Route optimized from 985 Moodie Drive and back. Follow the reordered stop list from top to bottom. Live traffic is not included.",
+      );
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Could not optimize route.",
+      );
     } finally {
       setOptimizing(false);
     }
@@ -838,7 +986,9 @@ export default function Tracker() {
     }
 
     setStops([]);
+
     setCompleted([]);
+
     setMessage("Route cleared.");
   };
 
@@ -849,12 +999,15 @@ export default function Tracker() {
             (completed.length / (stops.length + completed.length)) * 100,
           )
         : 0,
+
     [stops.length, completed.length],
   );
 
   const updateAddress = (value: string) => {
     setAddress(value);
+
     selectedPlaceRef.current = null;
+
     setSuggestionsOpen(true);
   };
 
@@ -863,97 +1016,145 @@ export default function Tracker() {
       <style jsx>{`
         .camera-box {
           margin-top: 14px;
+
           overflow: hidden;
+
           border: 1px solid #dce4eb;
+
           border-radius: 14px;
+
           background: #101820;
         }
 
         .camera-preview {
           position: relative;
+
           width: 100%;
+
           aspect-ratio: 4 / 3;
+
           overflow: hidden;
+
           background: #101820;
         }
 
         .camera-preview video {
           display: block;
+
           width: 100%;
+
           height: 100%;
+
           object-fit: cover;
         }
 
         .scan-overlay {
           position: absolute;
+
           inset: 0;
+
           display: flex;
+
           align-items: center;
+
           justify-content: center;
+
           pointer-events: none;
+
           background: rgba(0, 0, 0, 0.15);
         }
 
         .scan-frame {
           position: relative;
+
           width: 90%;
+
           height: 44%;
+
           border: 1px dashed rgba(255, 255, 255, 0.8);
+
           border-radius: 8px;
         }
 
         .corner {
           position: absolute;
+
           width: 24px;
+
           height: 24px;
+
           border-color: #32d583;
+
           border-style: solid;
         }
 
         .top-left {
           top: -2px;
+
           left: -2px;
+
           border-width: 4px 0 0 4px;
+
           border-radius: 7px 0 0 0;
         }
 
         .top-right {
           top: -2px;
+
           right: -2px;
+
           border-width: 4px 4px 0 0;
+
           border-radius: 0 7px 0 0;
         }
 
         .bottom-left {
           bottom: -2px;
+
           left: -2px;
+
           border-width: 0 0 4px 4px;
+
           border-radius: 0 0 0 7px;
         }
 
         .bottom-right {
           right: -2px;
+
           bottom: -2px;
+
           border-width: 0 4px 4px 0;
+
           border-radius: 0 0 7px 0;
         }
 
         .scan-line {
           position: absolute;
+
           top: 50%;
+
           left: 4%;
+
           width: 92%;
+
           height: 2px;
+
           background: #32d583;
+
           box-shadow: 0 0 8px rgba(50, 213, 131, 0.8);
         }
 
         .scan-instructions {
           margin: 0;
+
           padding: 12px;
+
           color: #fff;
+
           font-size: 13px;
+
           line-height: 1.5;
+
           text-align: center;
         }
 
@@ -963,33 +1164,52 @@ export default function Tracker() {
 
         .address-suggestions {
           position: absolute;
+
           z-index: 1000;
+
           top: calc(100% - 2px);
+
           right: 0;
+
           left: 0;
+
           overflow: hidden;
+
           border: 1px solid #dce4eb;
+
           border-radius: 0 0 12px 12px;
+
           background: #fff;
+
           box-shadow: 0 10px 25px rgba(16, 24, 40, 0.12);
         }
 
         .suggestion-button {
           display: block;
+
           width: 100%;
+
           padding: 12px 14px;
+
           border: 0;
+
           border-bottom: 1px solid #edf0f3;
+
           background: #fff;
+
           color: #202c39;
+
           font: inherit;
+
           text-align: left;
+
           cursor: pointer;
         }
 
         .suggestion-button:hover,
         .suggestion-button:focus {
           background: #f0f7ff;
+
           outline: none;
         }
 
@@ -999,72 +1219,115 @@ export default function Tracker() {
 
         .suggestion-main {
           display: block;
+
           font-size: 13px;
+
           font-weight: 600;
+
           line-height: 1.45;
         }
 
         .suggestion-caption {
           display: block;
+
           margin-top: 6px;
+
           padding: 7px 10px;
+
           background: #f8fafc;
+
           color: #64748b;
+
           font-size: 10px;
+
           text-align: right;
         }
 
         .optimize-button {
           display: flex;
+
           width: 100%;
+
           align-items: center;
+
           justify-content: center;
+
           gap: 9px;
+
           margin: 0 0 14px;
+
           padding: 12px 14px;
+
           border: 1px solid #b9d7fa;
+
           border-radius: 12px;
+
           background: #eff6ff;
+
           color: #174b87;
+
           font: inherit;
+
           font-size: 13px;
+
           font-weight: 700;
+
           cursor: pointer;
         }
 
         .optimize-button:disabled {
           opacity: 0.55;
+
           cursor: wait;
         }
 
         .stop-description {
           display: block;
+
           margin-top: 7px;
+
           color: #a65d00;
+
           font-size: 13px;
+
           font-weight: 700;
+
           line-height: 1.45;
+
           overflow-wrap: anywhere;
         }
 
         .stop-actions {
           display: flex;
+
           align-items: center;
+
           gap: 7px;
+
           flex-shrink: 0;
         }
 
         .delete-button {
           display: inline-flex;
+
           width: 34px;
+
           height: 34px;
+
           align-items: center;
+
           justify-content: center;
+
           border: 1px solid #f1c9c9;
+
           border-radius: 9px;
+
           background: #fff;
+
           color: #b42318;
+
           font-size: 18px;
+
           cursor: pointer;
         }
 
@@ -1083,21 +1346,25 @@ export default function Tracker() {
 
           .stop-details {
             min-width: 0;
+
             flex: 1;
           }
 
           .stop-actions {
             width: 100%;
+
             justify-content: flex-end;
           }
 
           .scan-frame {
             width: 92%;
+
             height: 40%;
           }
 
           .corner {
             width: 20px;
+
             height: 20px;
           }
         }
@@ -1106,6 +1373,7 @@ export default function Tracker() {
       <header className="topbar">
         <a className="brand" href="#">
           <span className="brand-mark">R</span>
+
           <span>
             route<span className="brand-accent">pin</span>
             <small>DELIVERY STOP TRACKER</small>
@@ -1127,11 +1395,14 @@ export default function Tracker() {
       <section className="welcome">
         <div>
           <div className="eyebrow">YOUR ROUTE, AT A GLANCE</div>
+
           <h1>
             Make every stop <span>count.</span>
           </h1>
+
           <p>Scan a package, pin the address, and keep your day moving.</p>
         </div>
+
         <div className="date-chip">● &nbsp; LIVE ROUTE</div>
       </section>
 
@@ -1140,27 +1411,34 @@ export default function Tracker() {
           <div className="stat-label">
             REMAINING STOPS <span>↗</span>
           </div>
+
           <div className="stat-number">
             {stops.length.toString().padStart(2, "0")}
           </div>
+
           <div className="stat-foot">Deliveries left to complete</div>
         </div>
 
         <div className="stat-card">
           <div className="stat-label">COMPLETED</div>
+
           <div className="stat-number">
             {completed.length.toString().padStart(2, "0")}
           </div>
+
           <div className="stat-foot">Stops finished today</div>
         </div>
 
         <div className="stat-card progress-card">
           <div className="stat-label">ROUTE PROGRESS</div>
+
           <div className="progress-row">
             <div className="stat-number">
               {progress}
+
               <small>%</small>
             </div>
+
             <div
               className="progress-ring"
               style={{
@@ -1170,9 +1448,11 @@ export default function Tracker() {
               <div />
             </div>
           </div>
+
           <div className="progress-track">
             <span style={{ width: `${progress}%` }} />
           </div>
+
           <div className="stat-foot">Keep up the good work</div>
         </div>
       </section>
@@ -1182,12 +1462,14 @@ export default function Tracker() {
           <div className="panel-heading">
             <div>
               <h2>Stop map</h2>
+
               <p>
                 {stops.length
                   ? `${stops.length} active ${stops.length === 1 ? "stop" : "stops"} on your route`
                   : "Your scanned stops will appear here"}
               </p>
             </div>
+
             <span className="map-legend">
               <i /> Active stop
             </span>
@@ -1199,7 +1481,9 @@ export default function Tracker() {
             {!stops.length && (
               <div className="map-empty">
                 <div className="empty-icon">⌖</div>
+
                 <strong>Your route starts here</strong>
+
                 <span>Add your first package to see it on the map.</span>
               </div>
             )}
@@ -1207,6 +1491,7 @@ export default function Tracker() {
 
           <div className="map-footer">
             <span>Map data © OpenStreetMap contributors</span>
+
             <span>Tap a pin for directions</span>
           </div>
         </div>
@@ -1215,8 +1500,10 @@ export default function Tracker() {
           <div className="panel-heading side-heading">
             <div>
               <h2>Add a stop</h2>
+
               <p>Scan the barcode or enter details</p>
             </div>
+
             <span className="step-badge">01</span>
           </div>
 
@@ -1226,14 +1513,17 @@ export default function Tracker() {
             onClick={scannerOpen ? stopScanner : scanBarcode}
           >
             <span className="scan-icon">▦</span>
+
             <span>
               <strong>
                 {scannerOpen ? "Stop scanning" : "Scan package barcode"}
               </strong>
+
               <small>
                 {scannerOpen ? "Camera is active" : "Use your phone camera"}
               </small>
             </span>
+
             <span className="button-arrow">{scannerOpen ? "×" : "↗"}</span>
           </button>
 
@@ -1245,9 +1535,13 @@ export default function Tracker() {
                 <div className="scan-overlay" aria-hidden="true">
                   <div className="scan-frame">
                     <span className="corner top-left" />
+
                     <span className="corner top-right" />
+
                     <span className="corner bottom-left" />
+
                     <span className="corner bottom-right" />
+
                     <span className="scan-line" />
                   </div>
                 </div>
@@ -1273,6 +1567,7 @@ export default function Tracker() {
                 value={barcode}
                 onChange={(e) => {
                   const value = e.target.value;
+
                   setBarcode(value);
 
                   const parsed = parseFedExPayload(value);
@@ -1280,6 +1575,7 @@ export default function Tracker() {
                   if (parsed) {
                     if (parsed.address) {
                       setAddress(parsed.address);
+
                       selectedPlaceRef.current = null;
                     }
 
@@ -1388,6 +1684,7 @@ export default function Tracker() {
 
           <div className="privacy-note">
             <span>ⓘ</span>
+
             <p>
               PDF417 barcodes are decoded in your browser. Confirm the address
               and package description before adding a stop.
@@ -1400,6 +1697,7 @@ export default function Tracker() {
         <div className="section-heading">
           <div>
             <div className="eyebrow">YOUR DELIVERY LIST</div>
+
             <h2>
               Stops to make <span className="count-pill">{stops.length}</span>
             </h2>
@@ -1423,9 +1721,10 @@ export default function Tracker() {
           onClick={() => void optimizeRoute()}
         >
           <span>{optimizing ? "◌" : "⌖"}</span>
+
           {optimizing
             ? "Optimizing route…"
-            : `Optimize route from my location (${stops.length} stops)`}
+            : `Optimize round trip from 985 Moodie Drive (${stops.length} stops)`}
         </button>
 
         {stops.length ? (
@@ -1433,13 +1732,12 @@ export default function Tracker() {
             {stops.map((stop, index) => (
               <article className="stop-item" key={stop.id}>
                 <div className="stop-index">
-                  {String(stops.length - index).padStart(2, "0")}
+                  {String(index + 1).padStart(2, "0")}
                 </div>
 
                 <div className="stop-details">
-                  <strong>
-                    {stop.name || `Delivery stop ${stops.length - index}`}
-                  </strong>
+                  <strong>{stop.name || `Delivery stop ${index + 1}`}</strong>
+
                   <span>{stop.address}</span>
 
                   {stop.description && (
@@ -1483,8 +1781,10 @@ export default function Tracker() {
         ) : (
           <div className="list-empty">
             <span>✓</span>
+
             <div>
               <strong>All caught up</strong>
+
               <p>
                 No active stops. Scan a package or add an address to get
                 started.
@@ -1504,6 +1804,7 @@ export default function Tracker() {
 
                   <div className="stop-details">
                     <strong>{stop.name || "Delivery stop"}</strong>
+
                     <span>{stop.address}</span>
 
                     {stop.description && (
@@ -1543,6 +1844,7 @@ export default function Tracker() {
         <span>
           ROUTEPIN <b>•</b> BUILT FOR THE ROAD
         </span>
+
         <span>
           Stops are stored locally on this device. Don&apos;t enter unnecessary
           customer information.
