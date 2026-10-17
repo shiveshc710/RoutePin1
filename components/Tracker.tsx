@@ -476,8 +476,6 @@ export default function Tracker() {
 
   const [description, setDescription] = useState("");
 
-  const [deliveryType, setDeliveryType] = useState<DeliveryType>("Unknown");
-
   const [busy, setBusy] = useState(false);
 
   const [message, setMessage] = useState("");
@@ -485,6 +483,7 @@ export default function Tracker() {
   const [scannerOpen, setScannerOpen] = useState(false);
 
   const [showCompleted, setShowCompleted] = useState(false);
+  const [stopSearch, setStopSearch] = useState("");
 
   const [suggestions, setSuggestions] = useState<AddressSuggestion[]>([]);
 
@@ -798,17 +797,11 @@ export default function Tracker() {
           }
 
           if (parsed.name) setName(parsed.name);
-          if (parsed.deliveryType !== "Unknown") {
-            setDeliveryType(parsed.deliveryType);
-          }
 
           const extraDetails = [
             parsed.postalCode && `Postal code: ${parsed.postalCode}`,
 
             parsed.weight && `Weight: ${parsed.weight}`,
-
-            parsed.deliveryType !== "Unknown" &&
-              `Delivery type: ${parsed.deliveryType}`,
 
             parsed.references.length > 0 &&
               `References: ${parsed.references.join(", ")}`,
@@ -1008,11 +1001,7 @@ export default function Tracker() {
                   packages: nextPackages,
                   barcode: stop.barcode || normalizedBarcode,
                   description: stop.description || packageItem.description,
-                  deliveryType:
-                    stop.deliveryType === "Unknown" &&
-                    deliveryType !== "Unknown"
-                      ? deliveryType
-                      : stop.deliveryType,
+                  deliveryType: stop.deliveryType,
                 }
               : stop,
           ),
@@ -1038,11 +1027,7 @@ export default function Tracker() {
             packages: nextPackages,
             barcode: completedMatch.barcode || normalizedBarcode,
             description: completedMatch.description || packageItem.description,
-            deliveryType:
-              completedMatch.deliveryType === "Unknown" &&
-              deliveryType !== "Unknown"
-                ? deliveryType
-                : completedMatch.deliveryType,
+            deliveryType: completedMatch.deliveryType,
           };
           setCompleted((current) =>
             current.filter((stop) => stop.id !== completedMatch.id),
@@ -1059,7 +1044,7 @@ export default function Tracker() {
             barcode: normalizedBarcode,
             description: packageItem.description,
             packages: [packageItem],
-            deliveryType,
+            deliveryType: "Unknown",
             lat: lat as number,
             lng: lng as number,
             createdAt: Date.now(),
@@ -1075,7 +1060,7 @@ export default function Tracker() {
       setBarcode("");
       setName("");
       setDescription("");
-      setDeliveryType("Unknown");
+
       selectedPlaceRef.current = null;
       placesSessionRef.current = null;
       setSuggestions([]);
@@ -1240,32 +1225,12 @@ export default function Tracker() {
     [stops, completed],
   );
 
-  const updateStopDeliveryType = (
-    id: string,
-    nextType: DeliveryType,
-    isCompleted = false,
-  ) => {
-    if (isCompleted) {
-      setCompleted((current) =>
-        current.map((stop) =>
-          stop.id === id ? { ...stop, deliveryType: nextType } : stop,
-        ),
-      );
-    } else {
-      setStops((current) =>
-        current.map((stop) =>
-          stop.id === id ? { ...stop, deliveryType: nextType } : stop,
-        ),
-      );
-    }
-  };
-
   const clearPackageFields = () => {
     setBarcode("");
     setAddress("");
     setName("");
     setDescription("");
-    setDeliveryType("Unknown");
+
     setSuggestions([]);
     setSuggestionsOpen(false);
     selectedPlaceRef.current = null;
@@ -1280,6 +1245,22 @@ export default function Tracker() {
 
     setSuggestionsOpen(true);
   };
+
+  const searchTerm = stopSearch.trim().toLowerCase();
+  const matchesStopSearch = (stop: Stop) =>
+    !searchTerm ||
+    [
+      stop.name,
+      stop.address,
+      stop.barcode,
+      stop.description,
+      ...packagesForStop(stop).flatMap((item) => [
+        item.barcode,
+        item.description,
+      ]),
+    ].some((value) => (value ?? "").toLowerCase().includes(searchTerm));
+  const visibleStops = stops.filter(matchesStopSearch);
+  const visibleCompleted = completed.filter(matchesStopSearch);
 
   return (
     <main className="app-shell">
@@ -1936,9 +1917,6 @@ export default function Tracker() {
                     }
 
                     if (parsed.name) setName(parsed.name);
-                    if (parsed.deliveryType !== "Unknown") {
-                      setDeliveryType(parsed.deliveryType);
-                    }
 
                     setMessage(
                       parsed.address
@@ -1958,20 +1936,6 @@ export default function Tracker() {
                 onChange={(e) => setName(e.target.value)}
                 placeholder="e.g. Smith residence"
               />
-            </label>
-
-            <label>
-              DELIVERY TYPE <span>OPTIONAL · UNKNOWN IF NOT SURE</span>
-              <select
-                value={deliveryType}
-                onChange={(e) =>
-                  setDeliveryType(e.target.value as DeliveryType)
-                }
-              >
-                <option value="Unknown">Unknown</option>
-                <option value="Residential">Residential</option>
-                <option value="Business">Business</option>
-              </select>
             </label>
 
             <label>
@@ -2096,6 +2060,32 @@ export default function Tracker() {
           </button>
         </div>
 
+        <div className="stop-search-wrap">
+          <input
+            type="search"
+            className="stop-search-input"
+            placeholder="Search address, recipient, barcode or truck location"
+            aria-label="Search saved delivery stops"
+            value={stopSearch}
+            onChange={(event) => setStopSearch(event.target.value)}
+          />
+          {stopSearch && (
+            <button
+              type="button"
+              className="stop-search-clear"
+              onClick={() => setStopSearch("")}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        {searchTerm && (
+          <p className="stop-search-count">
+            {visibleStops.length} active and {visibleCompleted.length} completed
+            matches
+          </p>
+        )}
+
         <button
           type="button"
           className="optimize-button"
@@ -2109,9 +2099,9 @@ export default function Tracker() {
             : `Optimize round trip from 985 Moodie Drive (${stops.length} stops)`}
         </button>
 
-        {stops.length ? (
+        {visibleStops.length ? (
           <div className="stop-list">
-            {stops.map((stop, index) => (
+            {visibleStops.map((stop, index) => (
               <article className="stop-item" key={stop.id}>
                 <div className="stop-index">
                   {String(index + 1).padStart(2, "0")}
@@ -2120,37 +2110,9 @@ export default function Tracker() {
                 <div className="stop-details">
                   <div className="stop-title-row">
                     <strong>{stop.name || `Delivery stop ${index + 1}`}</strong>
-                    {stop.deliveryType === "Business" && (
-                      <span className="delivery-badge business-badge">
-                        Business
-                      </span>
-                    )}
-                    {stop.deliveryType === "Residential" && (
-                      <span className="delivery-badge residential-badge">
-                        Residential
-                      </span>
-                    )}
                   </div>
 
                   <span>{stop.address}</span>
-
-                  <label className="stop-type-control">
-                    Delivery type
-                    <select
-                      value={stop.deliveryType ?? "Unknown"}
-                      onChange={(e) =>
-                        updateStopDeliveryType(
-                          stop.id,
-                          e.target.value as DeliveryType,
-                        )
-                      }
-                      aria-label={`Delivery type for ${stop.name || stop.address}`}
-                    >
-                      <option value="Unknown">Unknown</option>
-                      <option value="Residential">Residential</option>
-                      <option value="Business">Business</option>
-                    </select>
-                  </label>
 
                   <span className="package-count">
                     {packagesForStop(stop).length} package
@@ -2174,18 +2136,11 @@ export default function Tracker() {
                 <div className="stop-actions">
                   <a
                     className="navigate-button"
-                    href={
-                      stop.deliveryType === "Business" && stop.name
-                        ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${stop.name} ${stop.address}`)}`
-                        : googleMapsUrl(stop.address)
-                    }
+                    href={googleMapsUrl(stop.address)}
                     target="_blank"
                     rel="noreferrer"
                   >
-                    {stop.deliveryType === "Business"
-                      ? "Find business"
-                      : "Navigate"}{" "}
-                    <span>↗</span>
+                    Navigate <span>↗</span>
                   </a>
 
                   <button
@@ -2217,57 +2172,30 @@ export default function Tracker() {
               <strong>All caught up</strong>
 
               <p>
-                No active stops. Scan a package or add an address to get
-                started.
+                {searchTerm
+                  ? "No active stops match your search."
+                  : "No active stops. Scan a package or add an address to get started."}
               </p>
             </div>
           </div>
         )}
 
-        {showCompleted && (
+        {(showCompleted ||
+          (searchTerm.length > 0 && visibleCompleted.length > 0)) && (
           <div className="completed-list">
             <div className="completed-title">COMPLETED DELIVERIES</div>
 
-            {completed.length ? (
-              completed.map((stop) => (
+            {visibleCompleted.length ? (
+              visibleCompleted.map((stop) => (
                 <article className="stop-item completed-item" key={stop.id}>
                   <div className="stop-index done">✓</div>
 
                   <div className="stop-details">
                     <div className="stop-title-row">
                       <strong>{stop.name || "Delivery stop"}</strong>
-                      {stop.deliveryType === "Business" && (
-                        <span className="delivery-badge business-badge">
-                          Business
-                        </span>
-                      )}
-                      {stop.deliveryType === "Residential" && (
-                        <span className="delivery-badge residential-badge">
-                          Residential
-                        </span>
-                      )}
                     </div>
 
                     <span>{stop.address}</span>
-
-                    <label className="stop-type-control">
-                      Delivery type
-                      <select
-                        value={stop.deliveryType ?? "Unknown"}
-                        onChange={(e) =>
-                          updateStopDeliveryType(
-                            stop.id,
-                            e.target.value as DeliveryType,
-                            true,
-                          )
-                        }
-                        aria-label={`Delivery type for ${stop.name || stop.address}`}
-                      >
-                        <option value="Unknown">Unknown</option>
-                        <option value="Residential">Residential</option>
-                        <option value="Business">Business</option>
-                      </select>
-                    </label>
 
                     <span className="package-count">
                       {packagesForStop(stop).length} package

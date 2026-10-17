@@ -1177,85 +1177,10 @@ button {
 
 
 
-/* Delivery type badge at the top-right of each stop card */
-.stop-title-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  width: 100%;
-}
 
-.stop-title-row > strong {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.stop-title-row .delivery-badge {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  padding: 5px 9px;
-  font-size: 10px;
-  line-height: 1.2;
-  font-weight: 800;
-  white-space: nowrap;
-  margin-left: auto;
-}
-
-.stop-title-row .business-badge {
-  color: #8a4b00;
-  background: #ffedd5;
-  border: 1px solid #fdba74;
-}
-
-.stop-title-row .residential-badge {
-  color: #174ea6;
-  background: #dbeafe;
-  border: 1px solid #93c5fd;
-}
-
-.stop-title-row .delivery-badge {
-  display: inline-flex;
-}
-
-/* Delivery-type controls */
-.stop-form select,
-.stop-type-control select {
-  appearance: auto;
-  -webkit-appearance: menulist;
-  min-height: 42px;
-  padding: 10px 11px;
-  border: 1px solid #e2e7eb;
-  border-radius: 8px;
-  background: #fcfdfd;
-  color: var(--ink);
-  width: 100%;
-}
-
-.stop-form select:focus,
-.stop-type-control select:focus {
-  border-color: #e8b24d;
-  outline: none;
-  box-shadow: 0 0 0 3px #f5a6231c;
-}
-
-.stop-type-control {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  color: #73808b;
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.stop-type-control select {
-  width: auto;
-  min-height: 34px;
-  padding: 6px 9px;
-  font-size: 16px;
-}
+/* Search saved delivery stops */
+.stop-search-wrap { display:flex; gap:10px; align-items:center; margin:14px 0; }
+.stop-search-input { flex:1; min-width:0; padding:13px 15px; border:1px solid #cbd5e1; border-radius:12px; background:#fff; color:#172033; font-size:16px; }
+.stop-search-input:focus { outline:2px solid #f5a623; outline-offset:1px; }
+.stop-search-clear { padding:11px 14px; border:1px solid #cbd5e1; border-radius:10px; background:#fff; cursor:pointer; }
+.stop-search-count { font-size:12px; color:#64748b; margin:0 0 12px; }
