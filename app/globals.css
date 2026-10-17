@@ -1184,3 +1184,8 @@ button {
 .stop-search-input:focus { outline:2px solid #f5a623; outline-offset:1px; }
 .stop-search-clear { padding:11px 14px; border:1px solid #cbd5e1; border-radius:10px; background:#fff; cursor:pointer; }
 .stop-search-count { font-size:12px; color:#64748b; margin:0 0 12px; }
+
+/* Hardware zoom appears only when supported by the device */
+.camera-zoom-controls { display:flex; align-items:center; gap:12px; padding:10px 14px; color:white; font-size:13px; }
+.camera-zoom-controls label { white-space:nowrap; }
+.camera-zoom-controls input { flex:1; min-width:0; accent-color:#32d583; }

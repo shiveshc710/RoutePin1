@@ -514,6 +514,68 @@ export default function Tracker() {
   const hasScannedRef = useRef(false);
 
   const scannerStartingRef = useRef(false);
+  const [cameraZoom, setCameraZoom] = useState(1);
+  const [cameraZoomRange, setCameraZoomRange] = useState<{
+    min: number;
+    max: number;
+    step: number;
+  } | null>(null);
+  const cameraTrackRef = useRef<MediaStreamTrack | null>(null);
+
+  const changeCameraZoom = async (nextZoom: number) => {
+    const track = cameraTrackRef.current;
+    if (!track || !cameraZoomRange) return;
+    const zoom = Math.min(
+      cameraZoomRange.max,
+      Math.max(cameraZoomRange.min, nextZoom),
+    );
+    try {
+      await track.applyConstraints({ advanced: [{ zoom } as any] });
+      setCameraZoom(zoom);
+    } catch {
+      setMessage("Camera zoom is not supported on this device.");
+    }
+  };
+
+  const configureCamera = async (video: HTMLVideoElement) => {
+    const track =
+      video.srcObject instanceof MediaStream
+        ? video.srcObject.getVideoTracks()[0]
+        : undefined;
+    if (!track) return;
+    cameraTrackRef.current = track;
+    const capabilities = track.getCapabilities?.() as any;
+    if (!capabilities) return;
+    // Browsers may ignore focus controls, so keep these enhancements optional.
+    if (
+      Array.isArray(capabilities.focusMode) &&
+      capabilities.focusMode.includes("continuous")
+    ) {
+      try {
+        await track.applyConstraints({
+          advanced: [{ focusMode: "continuous" } as any],
+        });
+      } catch {
+        /* unsupported */
+      }
+    }
+    if (
+      capabilities.zoom &&
+      Number.isFinite(capabilities.zoom.min) &&
+      Number.isFinite(capabilities.zoom.max)
+    ) {
+      const range = capabilities.zoom;
+      const current = (track.getSettings() as any).zoom ?? range.min;
+      setCameraZoomRange({
+        min: range.min,
+        max: range.max,
+        step: range.step || 0.1,
+      });
+      setCameraZoom(current);
+    } else {
+      setCameraZoomRange(null);
+    }
+  };
 
   // Restore saved stops from local storage.
 
@@ -718,6 +780,8 @@ export default function Tracker() {
     controlsRef.current?.stop();
 
     controlsRef.current = null;
+    cameraTrackRef.current = null;
+    setCameraZoomRange(null);
 
     scannerStartingRef.current = false;
 
@@ -755,9 +819,10 @@ export default function Tracker() {
       const hints = new Map<DecodeHintType, unknown>();
 
       hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]);
+      hints.set(DecodeHintType.TRY_HARDER, true);
 
       const reader = new BrowserMultiFormatReader(hints, {
-        delayBetweenScanAttempts: 100,
+        delayBetweenScanAttempts: 60,
       });
 
       readerRef.current = reader;
@@ -786,6 +851,10 @@ export default function Tracker() {
         const format = String(result.getBarcodeFormat());
 
         const parsed = parseFedExPayload(raw);
+
+        if (typeof navigator !== "undefined" && "vibrate" in navigator) {
+          navigator.vibrate(80);
+        }
 
         setBarcode(raw);
 
@@ -841,9 +910,9 @@ export default function Tracker() {
             video: {
               facingMode: { ideal: "environment" },
 
-              width: { ideal: 1280 },
+              width: { ideal: 1920 },
 
-              height: { ideal: 720 },
+              height: { ideal: 1080 },
             },
           },
 
@@ -851,6 +920,7 @@ export default function Tracker() {
 
           onDecode,
         );
+        if (!hasScannedRef.current) void configureCamera(video);
       } catch (primaryError) {
         if (hasScannedRef.current) return;
 
@@ -873,9 +943,9 @@ export default function Tracker() {
                 exact: fallbackDevice.deviceId,
               },
 
-              width: { ideal: 1280 },
+              width: { ideal: 1920 },
 
-              height: { ideal: 720 },
+              height: { ideal: 1080 },
             },
           },
 
@@ -883,6 +953,7 @@ export default function Tracker() {
 
           onDecode,
         );
+        if (!hasScannedRef.current) void configureCamera(video);
       }
     } catch (error) {
       controlsRef.current?.stop();
@@ -1883,6 +1954,25 @@ export default function Tracker() {
                   </div>
                 </div>
               </div>
+
+              {cameraZoomRange && (
+                <div className="camera-zoom-controls">
+                  <label htmlFor="routepin-camera-zoom">
+                    Camera zoom: {cameraZoom.toFixed(1)}×
+                  </label>
+                  <input
+                    id="routepin-camera-zoom"
+                    type="range"
+                    min={cameraZoomRange.min}
+                    max={cameraZoomRange.max}
+                    step={cameraZoomRange.step}
+                    value={cameraZoom}
+                    onChange={(event) =>
+                      void changeCameraZoom(Number(event.target.value))
+                    }
+                  />
+                </div>
+              )}
 
               <p className="scan-instructions">
                 Align the entire PDF417 barcode inside the frame. Keep your
