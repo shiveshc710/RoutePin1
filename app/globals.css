@@ -1176,6 +1176,51 @@ button {
 }
 
 
+
+/* Delivery type badge at the top-right of each stop card */
+.stop-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+}
+
+.stop-title-row > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.stop-title-row .delivery-badge {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 800;
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+.stop-title-row .business-badge {
+  color: #8a4b00;
+  background: #ffedd5;
+  border: 1px solid #fdba74;
+}
+
+.stop-title-row .residential-badge {
+  color: #174ea6;
+  background: #dbeafe;
+  border: 1px solid #93c5fd;
+}
+
+.stop-title-row .delivery-badge {
+  display: inline-flex;
+}
+
 /* Delivery-type controls */
 .stop-form select,
 .stop-type-control select {

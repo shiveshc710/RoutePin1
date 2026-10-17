@@ -1009,7 +1009,8 @@ export default function Tracker() {
                   barcode: stop.barcode || normalizedBarcode,
                   description: stop.description || packageItem.description,
                   deliveryType:
-                    stop.deliveryType === "Unknown" && deliveryType !== "Unknown"
+                    stop.deliveryType === "Unknown" &&
+                    deliveryType !== "Unknown"
                       ? deliveryType
                       : stop.deliveryType,
                 }
@@ -1038,7 +1039,8 @@ export default function Tracker() {
             barcode: completedMatch.barcode || normalizedBarcode,
             description: completedMatch.description || packageItem.description,
             deliveryType:
-              completedMatch.deliveryType === "Unknown" && deliveryType !== "Unknown"
+              completedMatch.deliveryType === "Unknown" &&
+              deliveryType !== "Unknown"
                 ? deliveryType
                 : completedMatch.deliveryType,
           };
@@ -2116,7 +2118,19 @@ export default function Tracker() {
                 </div>
 
                 <div className="stop-details">
-                  <strong>{stop.name || `Delivery stop ${index + 1}`}</strong>
+                  <div className="stop-title-row">
+                    <strong>{stop.name || `Delivery stop ${index + 1}`}</strong>
+                    {stop.deliveryType === "Business" && (
+                      <span className="delivery-badge business-badge">
+                        Business
+                      </span>
+                    )}
+                    {stop.deliveryType === "Residential" && (
+                      <span className="delivery-badge residential-badge">
+                        Residential
+                      </span>
+                    )}
+                  </div>
 
                   <span>{stop.address}</span>
 
@@ -2160,11 +2174,18 @@ export default function Tracker() {
                 <div className="stop-actions">
                   <a
                     className="navigate-button"
-                    href={googleMapsUrl(stop.address)}
+                    href={
+                      stop.deliveryType === "Business" && stop.name
+                        ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${stop.name} ${stop.address}`)}`
+                        : googleMapsUrl(stop.address)
+                    }
                     target="_blank"
                     rel="noreferrer"
                   >
-                    Navigate <span>↗</span>
+                    {stop.deliveryType === "Business"
+                      ? "Find business"
+                      : "Navigate"}{" "}
+                    <span>↗</span>
                   </a>
 
                   <button
@@ -2213,7 +2234,19 @@ export default function Tracker() {
                   <div className="stop-index done">✓</div>
 
                   <div className="stop-details">
-                    <strong>{stop.name || "Delivery stop"}</strong>
+                    <div className="stop-title-row">
+                      <strong>{stop.name || "Delivery stop"}</strong>
+                      {stop.deliveryType === "Business" && (
+                        <span className="delivery-badge business-badge">
+                          Business
+                        </span>
+                      )}
+                      {stop.deliveryType === "Residential" && (
+                        <span className="delivery-badge residential-badge">
+                          Residential
+                        </span>
+                      )}
+                    </div>
 
                     <span>{stop.address}</span>
 
