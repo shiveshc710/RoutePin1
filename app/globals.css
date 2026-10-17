@@ -586,7 +586,8 @@ button {
 }
 
 .stop-form input,
-.stop-form textarea {
+.stop-form textarea,
+.stop-form select {
   display: block;
   width: 100%;
   margin-top: 6px;
@@ -596,7 +597,8 @@ button {
   padding: 10px 11px;
   outline: none;
   color: var(--ink);
-  font-size: 11px;
+  /* iOS Safari zooms focused inputs smaller than 16px. */
+  font-size: 16px;
   letter-spacing: 0;
   resize: vertical;
 }
@@ -1171,4 +1173,44 @@ button {
   .map-empty {
     width: 215px;
   }
+}
+
+
+/* Delivery-type controls */
+.stop-form select,
+.stop-type-control select {
+  appearance: auto;
+  -webkit-appearance: menulist;
+  min-height: 42px;
+  padding: 10px 11px;
+  border: 1px solid #e2e7eb;
+  border-radius: 8px;
+  background: #fcfdfd;
+  color: var(--ink);
+  width: 100%;
+}
+
+.stop-form select:focus,
+.stop-type-control select:focus {
+  border-color: #e8b24d;
+  outline: none;
+  box-shadow: 0 0 0 3px #f5a6231c;
+}
+
+.stop-type-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: #73808b;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.stop-type-control select {
+  width: auto;
+  min-height: 34px;
+  padding: 6px 9px;
+  font-size: 16px;
 }
